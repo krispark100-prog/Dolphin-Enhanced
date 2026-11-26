@@ -102,7 +102,7 @@ def find_file(suffix):
     return hits[0] if hits else None
 
 
-def patch(suffix, label, old, new, marker, count=1, regex=False, requires=None, done=None, hint=None, quiet=False):
+def patch(suffix, label, old, new, marker, count=1, regex=False, requires=None, done=None, hint=None, quiet=False, keep=False):
     path = find_file(suffix)
     if path is None:
         if not quiet:
@@ -132,7 +132,8 @@ def patch(suffix, label, old, new, marker, count=1, regex=False, requires=None, 
                     diag.append(f"--- {suffix} (lineas {lo + 1}-{hi}) ---\n" + "\n".join(lines[lo:hi]))
                     break
         return False
-    text = re.sub(pattern, lambda _m: new, text, count=count, flags=re.S)
+    text = re.sub(pattern, (lambda _m: _m.group(0) + new) if keep else (lambda _m: new),
+                  text, count=count, flags=re.S)
     path.write_text(text, encoding="utf-8")
     applied.append(label)
     return True
@@ -158,7 +159,8 @@ patch(
 
         val takeFlags = result.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION
         getContentResolver().takePersistableUriPermission(uri, takeFlags)""",
-    new="""// [fix] Persist the grant on the exact URI the picker returned. canonicalize() could turn
+    new="""org.dolphinemu.dolphinemu.utils.CrashLogger.log("onDirectorySelected uri=$uri")
+        // [fix] Persist the grant on the exact URI the picker returned. canonicalize() could turn
         // a tree URI into a document URI we hold no grant for -> SecurityException -> crash.
         try {
             contentResolver.takePersistableUriPermission(
@@ -498,6 +500,134 @@ patch(
     new="signingConfig (signingConfigs.release.storeFile?.exists() ? signingConfigs.release : signingConfigs.debug) // [fix-sign]",
     marker="[fix-sign]", count=0, regex=True, quiet=True,
 )
+
+
+# =========================================================================== DIAGNOSTICO + CARPETA DE USUARIO
+SRC_LOGGER = Path(__file__).parent / "crashlogger_src" / "CrashLogger.java"
+
+
+def create_next_to(anchor_suffix, filename, content, label):
+    anchor = find_file(anchor_suffix)
+    if anchor is None:
+        missing.append(f"{label}: no existe {anchor_suffix}")
+        return
+    dest = anchor.parent / filename
+    if dest.exists():
+        skipped.append(f"{label}: ya existe")
+        return
+    dest.write_text(content, encoding="utf-8")
+    applied.append(label)
+
+
+if SRC_LOGGER.exists():
+    create_next_to("utils/DirectoryInitialization.java", "CrashLogger.java",
+                   SRC_LOGGER.read_text(encoding="utf-8"), "Diagnostico: CrashLogger.java (archivo nuevo)")
+else:
+    missing.append("Diagnostico: falta .github/scripts/crashlogger_src/CrashLogger.java")
+
+patch(
+    "dolphinemu/DolphinApplication.java", "Diagnostico: instalar registro en Application",
+    old="application = this;",
+    new="application = this;\n    org.dolphinemu.dolphinemu.utils.CrashLogger.install(this);",
+    marker="CrashLogger.install",
+)
+patch(
+    "ui/main/MainActivity.kt", "Diagnostico: mostrar informe al abrir",
+    old="super.onCreate(savedInstanceState)",
+    new="super.onCreate(savedInstanceState)\n        org.dolphinemu.dolphinemu.utils.CrashLogger.showPendingReport(this)",
+    marker="CrashLogger.showPendingReport", hint=r"override fun onCreate",
+)
+patch(
+    "ui/main/MainActivity.kt", "Diagnostico: migas en onDirectorySelected",
+    old=r"fun onDirectorySelected\([^)]*\)\s*\{",
+    new='\n        org.dolphinemu.dolphinemu.utils.CrashLogger.log("onDirectorySelected iniciado")',
+    marker='CrashLogger.log("onDirectorySelected', regex=True, keep=True, quiet=True,
+)
+patch(
+    "model/GameFileCache.kt", "Diagnostico: migas en scanLibrary",
+    old=r"fun scanLibrary\([^)]*\)[^{=]*\{",
+    new='\n        org.dolphinemu.dolphinemu.utils.CrashLogger.log("scanLibrary iniciado")',
+    marker='CrashLogger.log("scanLibrary', regex=True, keep=True, quiet=True,
+)
+patch(
+    "model/GameFileCache.kt", "Diagnostico: migas en addGameFolder",
+    old=r"fun addGameFolder\([^)]*\)[^{=]*\{",
+    new='\n        org.dolphinemu.dolphinemu.utils.CrashLogger.log("addGameFolder: $path")',
+    marker='CrashLogger.log("addGameFolder', regex=True, keep=True, quiet=True,
+)
+
+# Carpeta de usuario: respaldo si /sdcard/dolphin-mmj no se puede usar (causa probable de
+# "ajustes no se guardan" y del crash al escanear: sin carpeta de usuario el nativo no se inicializa)
+patch(
+    "utils/DirectoryInitialization.java", "Carpeta de usuario: helper de comprobacion",
+    old="private static boolean setDolphinUserDirectory(Context context)",
+    new="""// [fix-userdir-helper]
+  private static boolean isUsableDirectory(File dir)
+  {
+    try
+    {
+      if (!dir.isDirectory() && !dir.mkdirs())
+        return false;
+      File probe = new File(dir, ".write_test");
+      if (!probe.exists() && !probe.createNewFile())
+        return false;
+      probe.delete();
+      return true;
+    }
+    catch (Exception e)
+    {
+      return false;
+    }
+  }
+
+  private static boolean setDolphinUserDirectory(Context context)""",
+    marker="[fix-userdir-helper]",
+)
+patch(
+    "utils/DirectoryInitialization.java", "Carpeta de usuario: respaldo en carpeta de la app",
+    old="""File userPath = new File(externalPath, "dolphin-mmj");
+    if (!userPath.isDirectory() && !userPath.mkdir())
+    {
+      return false;
+    }""",
+    new="""File userPath = new File(externalPath, "dolphin-mmj");
+    if (!isUsableDirectory(userPath))  // [fix-userdir]
+    {
+      // /sdcard/dolphin-mmj is not writable on this device: fall back to the app-specific folder
+      // so settings can be saved and the native side always gets a valid user directory.
+      File appDir = context.getExternalFilesDir(null);
+      if (appDir == null)
+        appDir = context.getFilesDir();
+      File fallback = new File(appDir, "dolphin-mmj");
+      CrashLogger.log("No se pudo usar " + userPath + "; probando " + fallback);
+      if (!isUsableDirectory(fallback))
+      {
+        CrashLogger.log("Tampoco se pudo usar " + fallback);
+        return false;
+      }
+      userPath = fallback;
+    }
+    CrashLogger.log("Directorio de usuario: " + userPath);""",
+    marker="[fix-userdir]", requires="[fix-userdir-helper]", hint=r"dolphin-mmj",
+)
+
+# Ajustes: crear carpeta, registrar ruta y errores de escritura
+patch(
+    "settings/utils/SettingsFile.java", "Ajustes: crear carpeta y registrar ruta",
+    old='writer = new PrintWriter(ini, "UTF-8");',
+    new="""ini.getParentFile().mkdirs();  // [fix-ini]
+      org.dolphinemu.dolphinemu.utils.CrashLogger.log("Guardando ajustes en " + ini);
+      writer = new PrintWriter(ini, "UTF-8");""",
+    marker="[fix-ini]", hint=r"PrintWriter",
+)
+patch(
+    "settings/utils/SettingsFile.java", "Ajustes: registrar error de escritura",
+    old='Log.error("[SettingsFile] File not found: "',
+    new=("org.dolphinemu.dolphinemu.utils.CrashLogger.log(\"Ajustes: no se pudo escribir \" + ini + \": \" + e.getMessage());\n"
+         "      Log.error(\"[SettingsFile] File not found: \""),
+    marker="Ajustes: no se pudo escribir",
+)
+
 
 for _suffix in ("app/build.gradle", "app/build.gradle.kts"):
     patch(
