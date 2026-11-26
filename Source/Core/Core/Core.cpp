@@ -11,8 +11,11 @@
 #include <queue>
 #include <utility>
 #include <variant>
-
-#include <fmt/time.h>
+#ifdef __ANDROID__
+#include <sched.h>
+#include <cstdio>
+#include <vector>
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -319,6 +322,79 @@ static void CPUSetInitialExecutionState()
   });
 }
 
+
+#ifdef __ANDROID__
+// Heterogeneous SoCs (e.g. the Unisoc T700 in the Moto G20: 2x Cortex-A75 + 6x Cortex-A55) let the
+// Linux scheduler park the CPU/GPU emulation threads on the slow cores, which shows up as random
+// FPS drops. Both clusters report the same max frequency on that chip, so we classify cores by
+// their ARM "CPU part" id from /proc/cpuinfo. If the CPU is homogeneous we do nothing.
+static bool IsLittleCorePart(unsigned part)
+{
+  switch (part)
+  {
+  case 0xd03:  // A53
+  case 0xd04:  // A35
+  case 0xd05:  // A55
+  case 0xd46:  // A510
+  case 0xd80:  // A520
+    return true;
+  default:
+    return false;
+  }
+}
+
+static const std::vector<int>& GetBigCores()
+{
+  static const std::vector<int> big_cores = [] {
+    std::vector<int> parts;
+    if (FILE* f = fopen("/proc/cpuinfo", "r"))
+    {
+      char line[256];
+      while (fgets(line, sizeof(line), f))
+      {
+        unsigned part = 0;
+        if (sscanf(line, "CPU part : %x", &part) == 1 || sscanf(line, "CPU part\t: %x", &part) == 1)
+          parts.push_back(static_cast<int>(part));
+      }
+      fclose(f);
+    }
+
+    std::vector<int> big;
+    const int n = static_cast<int>(parts.size());
+    for (int i = 0; i < n; ++i)
+    {
+      if (!IsLittleCorePart(static_cast<unsigned>(parts[i])))
+        big.push_back(i);
+    }
+
+    // Homogeneous CPU (all big or all little): nothing to gain from pinning.
+    // Pinning to a single big core would also starve the two heavy threads, so require >= 2.
+    if (big.size() < 2 || static_cast<int>(big.size()) == n)
+      big.clear();
+    return big;
+  }();
+  return big_cores;
+}
+
+static void PinCurrentThreadToBigCores()
+{
+  const std::vector<int>& big = GetBigCores();
+  if (big.empty())
+    return;
+
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  for (const int core : big)
+    CPU_SET(core, &set);
+  // pid 0 == the calling thread. Failure is harmless (e.g. restricted by the OS), so ignore it.
+  sched_setaffinity(0, sizeof(set), &set);
+}
+#else
+static void PinCurrentThreadToBigCores()
+{
+}
+#endif
+
 // Create the CPU thread, which is a CPU + Video thread in Single Core mode.
 static void CpuThread(const std::optional<std::string>& savestate_path, bool delete_savestate)
 {
@@ -329,6 +405,7 @@ static void CpuThread(const std::optional<std::string>& savestate_path, bool del
     Common::SetCurrentThreadName("CPU thread");
   else
     Common::SetCurrentThreadName("CPU-GPU thread");
+  PinCurrentThreadToBigCores();
 
   if (_CoreParameter.bFastmem)
     EMM::InstallExceptionHandler();  // Let's run under memory watch
@@ -585,6 +662,7 @@ static void EmuThread(std::unique_ptr<BootParameters> boot, WindowSystemInfo wsi
     // This thread, after creating the EmuWindow, spawns a CPU
     // thread, and then takes over and becomes the video thread
     Common::SetCurrentThreadName("Video thread");
+    PinCurrentThreadToBigCores();
     UndeclareAsCPUThread();
     FPURoundMode::LoadDefaultSIMDState();
 
@@ -679,20 +757,15 @@ static std::string GenerateScreenshotFolderPath()
 
 static std::string GenerateScreenshotName()
 {
+  std::string path = GenerateScreenshotFolderPath();
+
   // append gameId, path only contains the folder here.
-  const std::string path_prefix =
-      GenerateScreenshotFolderPath() + SConfig::GetInstance().GetGameID();
+  path += SConfig::GetInstance().GetGameID();
 
-  const std::time_t cur_time = std::time(nullptr);
-  const std::string base_name =
-      fmt::format("{}_{:%Y-%m-%d_%H-%M-%S}", path_prefix, *std::localtime(&cur_time));
-
-  // First try a filename without any suffixes, if already exists then append increasing numbers
-  std::string name = fmt::format("{}.png", base_name);
-  if (File::Exists(name))
+  std::string name;
+  for (int i = 1; File::Exists(name = StringFromFormat("%s-%d.png", path.c_str(), i)); ++i)
   {
-    for (u32 i = 1; File::Exists(name = fmt::format("{}_{}.png", base_name, i)); ++i)
-      ;
+    // TODO?
   }
 
   return name;
