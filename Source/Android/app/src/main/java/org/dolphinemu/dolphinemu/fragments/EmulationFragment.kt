@@ -197,8 +197,8 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback,
             STOPPED, RUNNING, PAUSED
         }
 
-        private var state: State
-        private var surface: Surface? = null
+        @Volatile private var state: State
+        @Volatile private var surface: Surface? = null
         private var runWhenSurfaceIsValid = false
 
         private var statePath: String? = null
@@ -274,17 +274,41 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback,
             }
         }
 
+        @Synchronized
         fun runWithValidSurface() {
             runWhenSurfaceIsValid = false
           when (state) {
               State.STOPPED -> {
+                // Capture the Surface now: the field can be nulled by surfaceDestroyed() before
+                // the new thread runs, and passing null to native code caused the black screen.
+                val startSurface = surface
+                val paths = mGamePaths
+                val startStatePath = statePath
+                if (startSurface == null || !startSurface.isValid || paths.isNullOrEmpty()) {
+                    runWhenSurfaceIsValid = true
+                    return
+                }
                 Thread({
-                  NativeLibrary.SurfaceChanged(surface)
-                  NativeLibrary.Run(mGamePaths, statePath)
+                  NativeLibrary.SurfaceChanged(startSurface)
+                  NativeLibrary.Run(paths, startStatePath)
+
+                  // Run() returns when emulation ends or when the game failed to boot. If the user
+                  // didn't ask for it (state != STOPPED), close the screen instead of leaving it black.
+                  val activity = EmulationActivity.get()
+                  if (activity != null && state != State.STOPPED) {
+                    activity.runOnUiThread {
+                      if (!activity.isFinishing) activity.exitEmulation()
+                    }
+                  }
                 }, "NativeEmulation").start()
               }
               State.PAUSED -> {
-                NativeLibrary.SurfaceChanged(surface)
+                val resumeSurface = surface
+                if (resumeSurface == null || !resumeSurface.isValid) {
+                    runWhenSurfaceIsValid = true
+                    return
+                }
+                NativeLibrary.SurfaceChanged(resumeSurface)
                 NativeLibrary.UnPauseEmulation()
               }
               else -> {
