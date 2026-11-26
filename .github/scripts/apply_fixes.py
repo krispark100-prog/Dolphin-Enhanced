@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
-applied, skipped, missing = [], [], []
+applied, skipped, missing, diag = [], [], [], []
 
 import subprocess
 
@@ -19,7 +19,7 @@ import subprocess
 # historial de git a la version que tenia tu rama justo antes de subirlos. Asi no hay que
 # revertir nada a mano. Cada marcador es un texto que solo existe en los archivos v1.
 V1_MARKERS = {
-    "Android/app/build.gradle": "-fno-math-errno",
+    "Android/app/build.gradle": "which breaks the IEEE-754 behaviour",
     "ui/main/MainActivity.kt": "We only ever read games",
     "model/GameFileCache.kt": "Scan only folders that still exist",
     "services/GameFileCacheService.java": "final GameFileCache cache = gameFileCache;",
@@ -82,7 +82,7 @@ def find_file(suffix):
     return hits[0] if hits else None
 
 
-def patch(suffix, label, old, new, marker, count=1, regex=False, requires=None, done=None):
+def patch(suffix, label, old, new, marker, count=1, regex=False, requires=None, done=None, hint=None):
     path = find_file(suffix)
     if path is None:
         missing.append(f"{label}: no existe {suffix}")
@@ -101,6 +101,13 @@ def patch(suffix, label, old, new, marker, count=1, regex=False, requires=None, 
     m = re.search(pattern, text, re.S)
     if not m:
         missing.append(f"{label}: no se encontro el fragmento en {suffix} (tu rama es distinta)")
+        if hint:
+            lines = text.splitlines()
+            for i, ln in enumerate(lines):
+                if re.search(hint, ln):
+                    lo, hi = max(0, i - 4), min(len(lines), i + 10)
+                    diag.append(f"--- {suffix} (lineas {lo + 1}-{hi}) ---\n" + "\n".join(lines[lo:hi]))
+                    break
         return
     text = re.sub(pattern, lambda _m: new, text, count=count, flags=re.S)
     path.write_text(text, encoding="utf-8")
@@ -154,13 +161,13 @@ patch(
         val folderPathsSet: MutableSet<String> = HashSet(
             preferences.getStringSet(GAME_FOLDER_PATHS_PREFERENCE, HashSet()) ?: HashSet()
         )""",
-    marker="[fix-copy]",
+    marker="[fix-copy]", hint=r"getStringSet",
 )
 patch(
     "model/GameFileCache.kt", "Cache: escanear solo carpetas existentes",
     old="val folderPaths = folderPathsSet.toTypedArray<String>()",
     new="val folderPaths = newFolderPaths.toTypedArray<String>() // [fix-existing]",
-    marker="[fix-existing]",
+    marker="[fix-existing]", hint=r"toTypedArray",
 )
 patch(
     "model/GameFileCache.kt", "Cache: copia del set en addGameFolder",
@@ -171,7 +178,7 @@ patch(
                 preferences.getStringSet(GAME_FOLDER_PATHS_PREFERENCE, HashSet()) ?: HashSet()
             )
             if (!folderPaths.contains(path)) {""",
-    marker="[fix-copy2]",
+    marker="[fix-copy2]", hint=r"fun addGameFolder",
 )
 
 # --------------------------------------------------------------------------- GameFileCacheService.java
@@ -449,13 +456,13 @@ patch(
     new='"-DCMAKE_BUILD_TYPE=Release", // [fix-flags]\n'
         '                    "-DCMAKE_C_FLAGS_RELEASE=-O3 -fno-math-errno -fno-trapping-math -DNDEBUG",\n'
         '                    "-DCMAKE_CXX_FLAGS_RELEASE=-O3 -fno-math-errno -fno-trapping-math -DNDEBUG"',
-    marker="[fix-flags]",
+    marker="[fix-flags]", hint=r"CMAKE_|arguments",
 )
 patch(
     "Android/app/build.gradle", "Gradle: firma con fallback a debug",
     old=r"signingConfig\s+signingConfigs\.release\b(?!\s*\{)",
     new="signingConfig (signingConfigs.release.storeFile?.exists() ? signingConfigs.release : signingConfigs.debug) // [fix-sign]",
-    marker="[fix-sign]", count=0, regex=True,
+    marker="[fix-sign]", count=0, regex=True, hint=r"signingConfig",
 )
 
 # --------------------------------------------------------------------------- resumen
@@ -475,6 +482,12 @@ for s in skipped:
 for m in missing:
     print(f"  [OMITIDO] {m}")
     print(f"::warning::{m}")
+
+if diag:
+    print("\n=== Diagnostico: como se ve ese codigo en tu rama (para adaptar los parches omitidos) ===")
+    for d in diag:
+        print(d)
+        print()
 
 if restore_errors:
     print("\nNo se pudieron restaurar algunos archivos del paquete anterior. "
