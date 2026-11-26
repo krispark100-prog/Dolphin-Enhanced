@@ -91,8 +91,7 @@ public final class CrashLogger
               message + "\n";
       writeFile(CRUMB_FILE, line, true);
       // Eventos que merecen mostrar el informe aunque la app no haya crasheado.
-      if (message.startsWith("No se pudo") || message.startsWith("Tampoco") ||
-              message.startsWith("Ajustes: no se pudo"))
+      if (message.startsWith("ALERTA"))
         writeFile(ALERT_FLAG, "1", false);
     }
     catch (Throwable ignored)
