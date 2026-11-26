@@ -178,12 +178,21 @@ void BootGame(const std::vector<std::string>& paths, const std::optional<std::st
 {
   std::unique_lock<std::mutex> guard(s_host_identity_lock);
 
-  // No use running the loop when booting fails
+  // GenerateFromFile() returns nullptr when the file can't be opened (bad content:// URI, missing
+  // file, unsupported format...). It used to be dereferenced unchecked, which crashed the app.
   std::unique_ptr<BootParameters> boot = BootParameters::GenerateFromFile(paths, savestate);
-  boot->delete_savestate = delete_savestate;
-  WindowSystemInfo wsi(WindowSystemType::Android, nullptr, s_surf);
-  wsi.render_surface_scale = s_scaled_density;
-  if (BootManager::BootCore(std::move(boot), wsi))
+  bool boot_attempted = false;
+  bool boot_ok = false;
+  if (boot)
+  {
+    boot_attempted = true;
+    boot->delete_savestate = delete_savestate;
+    WindowSystemInfo wsi(WindowSystemType::Android, nullptr, s_surf);
+    wsi.render_surface_scale = s_scaled_density;
+    boot_ok = BootManager::BootCore(std::move(boot), wsi);
+  }
+
+  if (boot_ok)
   {
     ButtonManager::Init(SConfig::GetInstance().GetGameID());
     static constexpr int WAIT_STEP = 25;
@@ -198,8 +207,20 @@ void BootGame(const std::vector<std::string>& paths, const std::optional<std::st
       Core::HostDispatchJobs();
     }
   }
+  else
+  {
+    // Tell the user instead of leaving them in front of a black surface forever.
+    __android_log_print(ANDROID_LOG_ERROR, DOLPHIN_TAG, "Failed to boot the selected game.");
+    guard.unlock();
+    MsgAlert("Dolphin",
+             "The game could not be started. Check that the file is readable and that the "
+             "folder permission was granted, then try again.",
+             false, Common::MsgType::Critical);
+    guard.lock();
+  }
 
-  Core::Shutdown();
+  if (boot_attempted)
+    Core::Shutdown();
   SConfig::GetInstance().SaveSettings();
   ButtonManager::Shutdown();
   guard.unlock();
@@ -584,12 +605,21 @@ JNIEXPORT void JNICALL Java_org_dolphinemu_dolphinemu_NativeLibrary_SurfaceChang
                                                                                    jclass,
                                                                                    jobject surf)
 {
-  s_surf = ANativeWindow_fromSurface(env, surf);
+  // ANativeWindow_fromSurface() crashes on a null Surface, which can happen when the Surface is
+  // destroyed right after the emulation thread starts (the usual cause of a black screen).
+  ANativeWindow* new_surf = surf ? ANativeWindow_fromSurface(env, surf) : nullptr;
+  ANativeWindow* old_surf = s_surf;
+  s_surf = new_surf;
+
   if (s_surf == nullptr)
     __android_log_print(ANDROID_LOG_ERROR, DOLPHIN_TAG, "Error: Surface is null.");
 
   if (g_renderer)
     g_renderer->ChangeSurface(s_surf);
+
+  // Release the previous window only after the renderer switched to the new one (was leaked).
+  if (old_surf && old_surf != new_surf)
+    ANativeWindow_release(old_surf);
 }
 
 JNIEXPORT void JNICALL Java_org_dolphinemu_dolphinemu_NativeLibrary_SurfaceDestroyed(JNIEnv* env,
