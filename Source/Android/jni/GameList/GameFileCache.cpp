@@ -27,6 +27,7 @@ JNIEXPORT void JNICALL Java_org_dolphinemu_dolphinemu_model_GameFileCache_init(J
 JNIEXPORT jobjectArray JNICALL
 Java_org_dolphinemu_dolphinemu_model_GameFileCache_getAllGames(JNIEnv* env, jobject)
 {
+  // [fix-jni]
   if (!g_game_file_cache)
     return env->NewObjectArray(0, IDCache::sGameFile.Clazz, nullptr);
 
@@ -34,11 +35,11 @@ Java_org_dolphinemu_dolphinemu_model_GameFileCache_getAllGames(JNIEnv* env, jobj
   const jobjectArray array = env->NewObjectArray(size, IDCache::sGameFile.Clazz, nullptr);
   jsize i = 0;
   g_game_file_cache->ForEach([env, array, size, &i](const auto& game_file) {
-    if (i >= size)  // the cache may have grown between GetSize() and ForEach()
+    if (i >= size)
       return;
     jobject java_game = GameFileToJava(env, game_file.get());
     env->SetObjectArrayElement(array, i++, java_game);
-    // Without this, big libraries overflow the JNI local reference table and the app aborts.
+    // Without this, big libraries overflow the JNI local reference table.
     if (java_game)
       env->DeleteLocalRef(java_game);
   });
@@ -48,33 +49,17 @@ Java_org_dolphinemu_dolphinemu_model_GameFileCache_getAllGames(JNIEnv* env, jobj
 JNIEXPORT jobject JNICALL Java_org_dolphinemu_dolphinemu_model_GameFileCache_addOrGet(JNIEnv* env, jobject,
                                                           jstring path)
 {
-  if (!g_game_file_cache)
+  if (!g_game_file_cache) // [fix-jni2]
     return nullptr;
 
   bool cache_changed = false;
-  return GameFileToJava(env,
-                        g_game_file_cache->AddOrGet(GetJString(env, path), &cache_changed).get());
+  return GameFileToJava(env, g_game_file_cache->AddOrGet(GetJString(env, path), &cache_changed).get());
 }
 
 JNIEXPORT jboolean JNICALL Java_org_dolphinemu_dolphinemu_model_GameFileCache_update(
     JNIEnv* env, jobject, jobjectArray folder_paths)
 {
-  if (!g_game_file_cache)
-    return JNI_FALSE;
-
-  jsize size = env->GetArrayLength(folder_paths);
-
-  std::vector<std::string> folder_paths_vector;
-  folder_paths_vector.reserve(size);
-
-  for (jsize i = 0; i < size; ++i)
-  {
-    const jstring path = reinterpret_cast<jstring>(env->GetObjectArrayElement(folder_paths, i));
-    folder_paths_vector.push_back(GetJString(env, path));
-    env->DeleteLocalRef(path);
-  }
-
-  return g_game_file_cache->Update(UICommon::FindAllGamePaths(folder_paths_vector, false));
+  return g_game_file_cache->Update(UICommon::FindAllGamePaths(JStringArrayToVector(env, folder_paths), false));
 }
 
 JNIEXPORT jboolean JNICALL

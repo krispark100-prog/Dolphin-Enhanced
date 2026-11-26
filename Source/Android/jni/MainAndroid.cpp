@@ -178,9 +178,10 @@ void BootGame(const std::vector<std::string>& paths, const std::optional<std::st
 {
   std::unique_lock<std::mutex> guard(s_host_identity_lock);
 
-  // GenerateFromFile() returns nullptr when the file can't be opened (bad content:// URI, missing
-  // file, unsupported format...). It used to be dereferenced unchecked, which crashed the app.
+  // No use running the loop when booting fails
   std::unique_ptr<BootParameters> boot = BootParameters::GenerateFromFile(paths, savestate);
+  // [fix-boot] GenerateFromFile() returns nullptr when the file can't be opened; it used to be
+  // dereferenced unchecked (crash).
   bool boot_attempted = false;
   bool boot_ok = false;
   if (boot)
@@ -207,9 +208,9 @@ void BootGame(const std::vector<std::string>& paths, const std::optional<std::st
       Core::HostDispatchJobs();
     }
   }
-  else
+
+  if (!boot_ok)  // [fix-boot2]
   {
-    // Tell the user instead of leaving them in front of a black surface forever.
     __android_log_print(ANDROID_LOG_ERROR, DOLPHIN_TAG, "Failed to boot the selected game.");
     guard.unlock();
     MsgAlert("Dolphin",
@@ -605,20 +606,16 @@ JNIEXPORT void JNICALL Java_org_dolphinemu_dolphinemu_NativeLibrary_SurfaceChang
                                                                                    jclass,
                                                                                    jobject surf)
 {
-  // ANativeWindow_fromSurface() crashes on a null Surface, which can happen when the Surface is
-  // destroyed right after the emulation thread starts (the usual cause of a black screen).
-  ANativeWindow* new_surf = surf ? ANativeWindow_fromSurface(env, surf) : nullptr;
-  ANativeWindow* old_surf = s_surf;
-  s_surf = new_surf;
-
+  ANativeWindow* old_surf = s_surf;  // [fix-surf]
+  s_surf = surf ? ANativeWindow_fromSurface(env, surf) : nullptr;
   if (s_surf == nullptr)
     __android_log_print(ANDROID_LOG_ERROR, DOLPHIN_TAG, "Error: Surface is null.");
 
   if (g_renderer)
     g_renderer->ChangeSurface(s_surf);
 
-  // Release the previous window only after the renderer switched to the new one (was leaked).
-  if (old_surf && old_surf != new_surf)
+  // [fix-surf2] release the previous window only after the renderer switched away from it
+  if (old_surf && old_surf != s_surf)
     ANativeWindow_release(old_surf);
 }
 

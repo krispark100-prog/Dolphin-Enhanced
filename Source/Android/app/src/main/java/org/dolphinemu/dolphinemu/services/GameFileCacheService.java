@@ -108,13 +108,12 @@ public final class GameFileCacheService extends IntentService
     // The existence of this one function, which is called from one
     // single place, forces us to use synchronization in onHandleIntent...
     // A bit annoying, but should be good enough for now
-    final GameFileCache cache = gameFileCache;
-    if (cache == null)
+    if (gameFileCache == null) // [fix-npe]
       return null;
 
-    synchronized (cache)
+    synchronized (gameFileCache)
     {
-      return cache.addOrGet(gamePath);
+      return gameFileCache.addOrGet(gamePath);
     }
   }
 
@@ -139,21 +138,24 @@ public final class GameFileCacheService extends IntentService
     {
       if (gameFileCache == null)
         return;
-      final GameFileCache cache = gameFileCache;
 
       // Rescan the file system and update the game list cache with the results
-      synchronized (cache)
+      synchronized (gameFileCache)
       {
-        try
+        boolean changed = gameFileCache.update(this);
+        if (changed)
         {
-          if (cache.scanLibrary(this))
-          {
-            updateGameFileArray();
-          }
+          updateGameFileArray();
         }
-        catch (Exception e)
+
+        boolean additionalMetadataChanged = gameFileCache.updateAdditionalMetadata();
+        if (additionalMetadataChanged)
         {
-          org.dolphinemu.dolphinemu.utils.Log.error("[GameFileCacheService] Rescan failed: " + e);
+          updateGameFileArray();
+        }
+        if (changed || additionalMetadataChanged)
+        {
+          gameFileCache.save();
         }
       }
     }
@@ -163,7 +165,7 @@ public final class GameFileCacheService extends IntentService
   {
     GameFile[] gameFilesTemp = gameFileCache.getAllGames();
     Arrays.sort(gameFilesTemp, (lhs, rhs) -> {
-        int ret = lhs.getGameId().compareToIgnoreCase(rhs.getGameId());
+        int ret = lhs.getTitle().compareToIgnoreCase(rhs.getTitle());
         return ret == 0 ? Integer.compare(lhs.getDiscNumber(), rhs.getDiscNumber()) : ret;
     });
     gameFiles.set(gameFilesTemp);

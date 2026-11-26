@@ -43,7 +43,7 @@ android {
                     "-DANDROID_PLATFORM=android-24",
                     "-DANDROID_TOOLCHAIN=clang",
                     "-DANDROID_ARM_NEON=TRUE",
-                    "-DCMAKE_CXX_FLAGS_RELEASE=-Ofast"
+                    "-DCMAKE_CXX_FLAGS_RELEASE=-O3 -fno-math-errno -fno-trapping-math -DNDEBUG"
                 )
                 abiFilters.add("arm64-v8a")
             }

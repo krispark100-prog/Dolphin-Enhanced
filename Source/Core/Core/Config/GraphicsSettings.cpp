@@ -83,7 +83,7 @@ const ConfigInfo<bool> GFX_WAIT_FOR_SHADERS_BEFORE_STARTING{
     {System::GFX, "Settings", "WaitForShadersBeforeStarting"}, false};
 const ConfigInfo<ShaderCompilationMode> GFX_SHADER_COMPILATION_MODE{
     {System::GFX, "Settings", "ShaderCompilationMode"},
-    ShaderCompilationMode::AsynchronousSkipRendering};
+    ShaderCompilationMode::AsynchronousSkipRendering}  /* [fix-shader] */;
 const ConfigInfo<int> GFX_SHADER_COMPILER_THREADS{
     {System::GFX, "Settings", "ShaderCompilerThreads"}, 1};
 const ConfigInfo<int> GFX_SHADER_PRECOMPILER_THREADS{

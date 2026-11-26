@@ -8,7 +8,10 @@ import android.content.pm.PackageManager
 import android.os.Bundle
 import android.preference.PreferenceManager
 import android.view.Menu
+import android.view.View
 import android.view.MenuItem
+import android.view.ViewGroup.MarginLayoutParams
+import android.widget.PopupMenu
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -17,6 +20,10 @@ import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import androidx.recyclerview.widget.DividerItemDecoration
 import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.RecyclerView
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.updatePadding
 import org.dolphinemu.dolphinemu.R
 import org.dolphinemu.dolphinemu.activities.EmulationActivity.Companion.launch
 import org.dolphinemu.dolphinemu.adapters.GameAdapter
@@ -27,21 +34,20 @@ import org.dolphinemu.dolphinemu.services.GameFileCacheService
 import org.dolphinemu.dolphinemu.utils.ContentHandler
 import org.dolphinemu.dolphinemu.utils.DirectoryInitialization
 import org.dolphinemu.dolphinemu.utils.FileBrowserHelper
-import org.dolphinemu.dolphinemu.utils.Log
 import org.dolphinemu.dolphinemu.utils.PermissionsHandler
 import org.dolphinemu.dolphinemu.utils.StartupHandler
 import org.dolphinemu.dolphinemu.utils.ThemeUtil
+import org.dolphinemu.dolphinemu.databinding.ActivityMainBinding
 import java.io.File
+import java.util.Arrays
 
 /**
  * The main Activity of the Lollipop style UI. Manages several PlatformGamesFragments, which
  * individually display a grid of available games for each Fragment, in a tabbed layout.
  */
 class MainActivity : AppCompatActivity() {
-    private var divider: DividerItemDecoration? = null
-    private var gameList: RecyclerView? = null
-    private var adapter: GameAdapter? = null
-    private var toolbar: Toolbar? = null
+    private val binding by lazy { ActivityMainBinding.inflate(layoutInflater) }
+    private var adapter: GameAdapter? = GameAdapter()
     private var broadcastReceiver: BroadcastReceiver? = null
     private var dirToAdd: String? = null
 
@@ -49,11 +55,24 @@ class MainActivity : AppCompatActivity() {
         ThemeUtil.applyTheme()
 
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
+        setContentView(binding.root)
 
-        findViews()
-        setSupportActionBar(toolbar)
-        title = String(TITLE_BYTES)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+
+        setInsets()
+
+        val pref = PreferenceManager.getDefaultSharedPreferences(this)
+        binding.gridGames.setAdapter(adapter)
+        refreshGameList(pref.getBoolean(PREF_GAMELIST, true))
+
+        binding.appBarLayout.apply {
+            binding.listingType.setOnClickListener { toggleGameList() }
+            binding.settingsIcon.setOnClickListener { launchSettingsActivity(MenuTag.CONFIG) }
+            binding.moreOptions.setOnClickListener { showMoreOptions(it) }
+        }
+
+        // TODO: make it to add games instead of folders
+        binding.add.setOnClickListener { launchFileListActivity() }
 
         val filter = IntentFilter()
         filter.addAction(GameFileCacheService.BROADCAST_ACTION)
@@ -75,29 +94,18 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        dirToAdd?.let { dir ->
+        if (dirToAdd != null) {
+            GameFileCache.addGameFolder(dirToAdd!!, this)
             dirToAdd = null
-            GameFileCache.addGameFolder(dir, this)
             GameFileCacheService.startRescan(this)
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        broadcastReceiver?.let {
-            LocalBroadcastManager.getInstance(this).unregisterReceiver(it)
-        }
-    }
-
-    // TODO: Replace with a ButterKnife injection.
-    private fun findViews() {
-        val pref = PreferenceManager.getDefaultSharedPreferences(this)
-        divider = DividerItemDecoration(this, DividerItemDecoration.VERTICAL)
-        toolbar = findViewById(R.id.toolbar_main)
-        gameList = findViewById(R.id.grid_games)
-        adapter = GameAdapter()
-        gameList!!.setAdapter(adapter)
-        refreshGameList(pref.getBoolean(PREF_GAMELIST, true))
+        LocalBroadcastManager.getInstance(this).unregisterReceiver(
+            broadcastReceiver!!
+        )
     }
 
     private fun refreshGameList(flag: Boolean) {
@@ -107,15 +115,13 @@ class MainActivity : AppCompatActivity() {
         if (flag) {
             resourceId = R.layout.card_game
             layoutManager = GridLayoutManager(this, columns)
-            gameList!!.addItemDecoration(divider!!)
         } else {
             columns = columns * 2 + 1
             resourceId = R.layout.card_game2
             layoutManager = GridLayoutManager(this, columns)
-            gameList!!.removeItemDecoration(divider!!)
         }
         adapter!!.setResourceId(resourceId)
-        gameList!!.layoutManager = layoutManager
+        binding.gridGames.layoutManager = layoutManager
     }
 
     private fun toggleGameList() {
@@ -125,57 +131,34 @@ class MainActivity : AppCompatActivity() {
         refreshGameList(flag)
     }
 
-    override fun onCreateOptionsMenu(menu: Menu): Boolean {
-        val inflater = menuInflater
-        inflater.inflate(R.menu.menu_game_grid, menu)
-        return true
-    }
+    private fun setInsets() =
+        ViewCompat.setOnApplyWindowInsetsListener(
+            binding.root
+        ) { _: View, windowInsets: WindowInsetsCompat ->
+            val barInsets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
+            val cutoutInsets = windowInsets.getInsets(WindowInsetsCompat.Type.displayCutout())
+            val leftInsets = barInsets.left + cutoutInsets.left
+            val rightInsets = barInsets.right + cutoutInsets.right
 
-    override fun onOptionsItemSelected(item: MenuItem): Boolean {
-        when (item.itemId) {
-            R.id.menu_add_directory -> {
-                launchFileListActivity()
-                return true
-            }
+            val appBar = binding.appBarLayout.layoutParams as MarginLayoutParams
+            appBar.leftMargin = leftInsets
+            appBar.rightMargin = rightInsets
+            binding.appBarLayout.layoutParams = appBar
 
-            R.id.menu_toggle_list -> {
-                toggleGameList()
-                return true
-            }
+            binding.gridGames.updatePadding(
+                left = leftInsets,
+                right = rightInsets,
+                bottom = barInsets.bottom
+            )
+            val fab = binding.add.layoutParams as MarginLayoutParams
+            val fabPadding = resources.getDimensionPixelSize(R.dimen.spacing_large)
+            fab.leftMargin = leftInsets + fabPadding
+            fab.bottomMargin = barInsets.bottom + fabPadding
+            fab.rightMargin = rightInsets + fabPadding
+            binding.add.layoutParams = fab
 
-            R.id.menu_settings_core -> {
-                launchSettingsActivity(MenuTag.CONFIG)
-                return true
-            }
-
-            R.id.menu_settings_gcpad -> {
-                launchSettingsActivity(MenuTag.GCPAD_TYPE)
-                return true
-            }
-
-            R.id.menu_settings_wiimote -> {
-                launchSettingsActivity(MenuTag.WIIMOTE)
-                return true
-            }
-
-            R.id.menu_clear_data -> {
-                clearGameData(this)
-                return true
-            }
-
-            R.id.menu_refresh -> {
-                GameFileCacheService.startRescan(this)
-                return true
-            }
-
-            R.id.menu_open_file -> {
-                launchOpenFileActivity()
-                return true
-            }
+            windowInsets
         }
-
-        return false
-    }
 
     private fun launchSettingsActivity(menuTag: MenuTag?) {
         SettingsActivity.launch(this, menuTag, "")
@@ -191,7 +174,7 @@ class MainActivity : AppCompatActivity() {
         val cachePath = DirectoryInitialization.getCacheDirectory(context)
         var dir = File(cachePath)
         if (dir.exists()) {
-            for (f in dir.listFiles() ?: emptyArray()) {
+            for (f in dir.listFiles() ?: emptyArray()) { // [fix-null]
                 if (f.name.endsWith(".uidcache")) {
                     if (f.delete()) {
                         count += 1
@@ -203,7 +186,7 @@ class MainActivity : AppCompatActivity() {
         val shadersPath = cachePath + File.separator + "Shaders"
         dir = File(shadersPath)
         if (dir.exists()) {
-            for (f in dir.listFiles() ?: emptyArray()) {
+            for (f in dir.listFiles() ?: emptyArray()) { // [fix-null]
                 if (f.name.endsWith(".cache")) {
                     if (f.delete()) {
                         count += 1
@@ -226,59 +209,49 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onDirectorySelected(result: Intent) {
-        val uri = result.data
-        if (uri == null) {
-            Log.error("[MainActivity] Directory picker returned no URI")
-            return
+        var uri = result.data
+
+        val childNames = ContentHandler.getChildNames(
+            uri!!, false
+        )
+        if (Arrays.stream(childNames).noneMatch { name: String? ->
+                FileBrowserHelper.GAME_EXTENSIONS.contains(
+                    FileBrowserHelper.getExtension(name, false)
+                )
+            }) {
+            val builder = AlertDialog.Builder(this)
+            builder.setMessage(
+                getString(
+                    R.string.wrong_file_extension_in_directory,
+                    FileBrowserHelper.setToSortedDelimitedString(FileBrowserHelper.GAME_EXTENSIONS)
+                )
+            )
+            builder.setPositiveButton(android.R.string.ok, null)
+            builder.show()
         }
 
-        // 1) Persist the permission on the exact URI the picker gave us. Doing it before anything
-        //    else (and without canonicalize(), which can turn a tree URI into a document URI that
-        //    we hold no grant for) avoids the SecurityException that used to crash the app.
+        // [fix] Persist the grant on the exact URI the picker returned. canonicalize() could turn
+        // a tree URI into a document URI we hold no grant for -> SecurityException -> crash.
         try {
-            // We only ever read games, so read access is all we ask to persist.
-            val takeFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION
-            contentResolver.takePersistableUriPermission(uri, takeFlags)
+            contentResolver.takePersistableUriPermission(
+                uri!!, Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
         } catch (e: SecurityException) {
-            Log.warning("[MainActivity] Could not persist permission for $uri: ${e.message}")
-            // The grant for this session is still valid, so keep going.
+            org.dolphinemu.dolphinemu.utils.Log.warning(
+                "[MainActivity] Could not persist permission for $uri: ${e.message}"
+            )
         } catch (e: Exception) {
-            Log.error("[MainActivity] takePersistableUriPermission failed: ${e.message}")
-            Toast.makeText(this, R.string.write_permission_needed, Toast.LENGTH_LONG).show()
+            org.dolphinemu.dolphinemu.utils.Log.error(
+                "[MainActivity] takePersistableUriPermission failed: ${e.message}"
+            )
+            android.widget.Toast.makeText(
+                this, org.dolphinemu.dolphinemu.R.string.write_permission_needed,
+                android.widget.Toast.LENGTH_LONG
+            ).show()
             return
         }
 
         dirToAdd = uri.toString()
-
-        // 2) Listing a big folder can take a while, so do the sanity check off the UI thread.
-        Thread {
-            val hasGames = try {
-                ContentHandler.getChildNames(uri, false).any { name ->
-                    name != null && FileBrowserHelper.GAME_EXTENSIONS.contains(
-                        FileBrowserHelper.getExtension(name, false)
-                    )
-                }
-            } catch (e: Exception) {
-                true // can't tell; don't nag the user
-            }
-
-            if (!hasGames) {
-                runOnUiThread {
-                    if (isFinishing || isDestroyed) return@runOnUiThread
-                    AlertDialog.Builder(this)
-                        .setMessage(
-                            getString(
-                                R.string.wrong_file_extension_in_directory,
-                                FileBrowserHelper.setToSortedDelimitedString(
-                                    FileBrowserHelper.GAME_EXTENSIONS
-                                )
-                            )
-                        )
-                        .setPositiveButton(android.R.string.ok, null)
-                        .show()
-                }
-            }
-        }.start()
     }
 
     /**
@@ -290,8 +263,8 @@ class MainActivity : AppCompatActivity() {
         super.onActivityResult(requestCode, resultCode, result)
 
         // If the user picked a file, as opposed to just backing out.
-        if (resultCode == RESULT_OK && result != null) {
-            val uri = result.data ?: return
+        if (resultCode == RESULT_OK) {
+            val uri = result!!.data
             when (requestCode) {
                 REQUEST_ADD_DIRECTORY ->           // If the user picked a file, as opposed to just backing out.
                     onDirectorySelected(result)
@@ -300,7 +273,7 @@ class MainActivity : AppCompatActivity() {
                     FileBrowserHelper.runAfterExtensionCheck(
                         this, uri,
                         FileBrowserHelper.GAME_LIKE_EXTENSIONS
-                    ) { launch(this, uri.toString()) }
+                    ) { launch(this, result.data.toString()) }
             }
         }
     }
@@ -311,7 +284,7 @@ class MainActivity : AppCompatActivity() {
         grantResults: IntArray
     ) {
         when (requestCode) {
-            PermissionsHandler.REQUEST_CODE_WRITE_PERMISSION -> if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            PermissionsHandler.REQUEST_CODE_WRITE_PERMISSION -> if (grantResults[0] == PackageManager.PERMISSION_GRANTED) {
                 DirectoryInitialization.start(this)
                 GameFileCacheService.startLoad(this)
             } else {
@@ -327,28 +300,43 @@ class MainActivity : AppCompatActivity() {
         adapter!!.swapDataSet(GameFileCacheService.getAllGameFiles())
     }
 
+    private fun showMoreOptions(view: View) {
+        PopupMenu(this, view).apply {
+            menuInflater.inflate(R.menu.menu_main_more, menu)
+            setOnMenuItemClickListener { item ->
+                when (item.itemId) {
+                    R.id.menu_settings_gcpad -> {
+                        launchSettingsActivity(MenuTag.GCPAD_TYPE)
+                        true
+                    }
+                    R.id.menu_settings_wiimote -> {
+                        launchSettingsActivity(MenuTag.WIIMOTE)
+                        true
+                    }
+                    R.id.menu_clear_data -> {
+                        clearGameData(view.context)
+                        true
+                    }
+                    R.id.menu_refresh -> {
+                        GameFileCacheService.startRescan(view.context)
+                        true
+                    }
+
+                    R.id.menu_open_file -> {
+                        launchOpenFileActivity()
+                        true
+                    }
+                    else -> false
+                }
+            }
+            show()
+        }
+    }
+
     companion object {
         const val REQUEST_ADD_DIRECTORY = 1
         const val REQUEST_OPEN_FILE = 2
         const val REQUEST_GPU_DRIVER = 3
         private const val PREF_GAMELIST = "GAME_LIST_TYPE"
-        private val TITLE_BYTES = byteArrayOf(
-            0x44,
-            0x6f,
-            0x6c,
-            0x70,
-            0x68,
-            0x69,
-            0x6e,
-            0x20,
-            0x35,
-            0x2e,
-            0x30,
-            0x28,
-            0x4d,
-            0x4d,
-            0x4a,
-            0x29
-        )
     }
 }
