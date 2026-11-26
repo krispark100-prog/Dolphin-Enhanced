@@ -12,6 +12,64 @@ from pathlib import Path
 ROOT = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
 applied, skipped, missing = [], [], []
 
+import subprocess
+
+# --------------------------------------------------------------------------- FASE 0
+# Si el fork aun contiene archivos COMPLETOS del paquete anterior (v1), se restauran desde el
+# historial de git a la version que tenia tu rama justo antes de subirlos. Asi no hay que
+# revertir nada a mano. Cada marcador es un texto que solo existe en los archivos v1.
+V1_MARKERS = {
+    "Android/app/build.gradle": "-fno-math-errno",
+    "ui/main/MainActivity.kt": "We only ever read games",
+    "model/GameFileCache.kt": "Scan only folders that still exist",
+    "services/GameFileCacheService.java": "final GameFileCache cache = gameFileCache;",
+    "fragments/EmulationFragment.kt": "Capture the Surface now: the field can be nulled",
+    "jni/GameList/GameFileCache.cpp": "big libraries overflow the JNI local reference table and the app aborts",
+    "jni/MainAndroid.cpp": "Failed to boot the selected game.",
+    "Core/Core/Core.cpp": "IsLittleCorePart",
+}
+restored, restore_errors = [], []
+
+
+def git(*args, cwd=None):
+    return subprocess.run(["git", *args], cwd=cwd or ROOT, capture_output=True, text=True)
+
+
+def restore_v1_files():
+    top = git("rev-parse", "--show-toplevel")
+    if top.returncode != 0:
+        return
+    top = Path(top.stdout.strip())
+    for suffix, marker in V1_MARKERS.items():
+        path = None
+        for p in ROOT.rglob("*"):
+            if p.is_file() and p.as_posix().endswith(suffix) and "/build/" not in p.as_posix() \
+                    and "/.cxx/" not in p.as_posix():
+                path = p
+                break
+        if path is None:
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if marker not in text or "[fix" in text:
+            continue
+        rel = path.relative_to(top).as_posix()
+        # ultimo commit que cambio la cantidad de apariciones del marcador (= el que lo agrego)
+        log = git("log", "-1", "--format=%H", f"-S{marker}", "--", rel, cwd=top)
+        sha = log.stdout.strip()
+        if not sha:
+            restore_errors.append(f"{rel}: no se encontro el commit que lo cambio (historial incompleto)")
+            continue
+        old = git("show", f"{sha}^:{rel}", cwd=top)
+        if old.returncode != 0:
+            restore_errors.append(f"{rel}: no existe version anterior a {sha[:8]}")
+            continue
+        path.write_text(old.stdout, encoding="utf-8", newline="")
+        restored.append(f"{rel} (version previa a {sha[:8]})")
+
+
+restore_v1_files()
+
+
 
 def flex(snippet):
     """Regex que ignora diferencias de espacios/saltos de linea entre tokens."""
@@ -24,7 +82,7 @@ def find_file(suffix):
     return hits[0] if hits else None
 
 
-def patch(suffix, label, old, new, marker, count=1, regex=False, requires=None):
+def patch(suffix, label, old, new, marker, count=1, regex=False, requires=None, done=None):
     path = find_file(suffix)
     if path is None:
         missing.append(f"{label}: no existe {suffix}")
@@ -32,6 +90,9 @@ def patch(suffix, label, old, new, marker, count=1, regex=False, requires=None):
     text = path.read_text(encoding="utf-8")
     if marker in text:
         skipped.append(f"{label}: ya aplicado")
+        return
+    if done and re.search(flex(done), text, re.S):
+        skipped.append(f"{label}: ya estaba asi")
         return
     if requires and requires not in text:
         missing.append(f"{label}: omitido porque falta el parche previo ({requires})")
@@ -378,6 +439,7 @@ patch(
     old='"ShaderCompilationMode"}, ShaderCompilationMode::Synchronous}',
     new='"ShaderCompilationMode"},\n    ShaderCompilationMode::AsynchronousSkipRendering}  /* [fix-shader] */',
     marker="[fix-shader]",
+    done='"ShaderCompilationMode"}, ShaderCompilationMode::AsynchronousSkipRendering}',
 )
 
 # --------------------------------------------------------------------------- app/build.gradle
@@ -397,6 +459,14 @@ patch(
 )
 
 # --------------------------------------------------------------------------- resumen
+print("\n=== Restauracion de archivos del paquete anterior ===")
+if not restored and not restore_errors:
+    print("  (nada que restaurar)")
+for r in restored:
+    print(f"  [RESTAURADO] {r}")
+for e in restore_errors:
+    print(f"  [ERROR]      {e}")
+    print(f"::error::{e}")
 print("\n=== Resumen de correcciones ===")
 for a in applied:
     print(f"  [OK]      {a}")
@@ -405,3 +475,8 @@ for s in skipped:
 for m in missing:
     print(f"  [OMITIDO] {m}")
     print(f"::warning::{m}")
+
+if restore_errors:
+    print("\nNo se pudieron restaurar algunos archivos del paquete anterior. "
+          "Restauralos a mano desde el historial de tu fork y vuelve a ejecutar.")
+    sys.exit(1)
