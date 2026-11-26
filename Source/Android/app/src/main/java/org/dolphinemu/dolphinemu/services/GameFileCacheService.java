@@ -108,9 +108,13 @@ public final class GameFileCacheService extends IntentService
     // The existence of this one function, which is called from one
     // single place, forces us to use synchronization in onHandleIntent...
     // A bit annoying, but should be good enough for now
-    synchronized (gameFileCache)
+    final GameFileCache cache = gameFileCache;
+    if (cache == null)
+      return null;
+
+    synchronized (cache)
     {
-      return gameFileCache.addOrGet(gamePath);
+      return cache.addOrGet(gamePath);
     }
   }
 
@@ -135,24 +139,21 @@ public final class GameFileCacheService extends IntentService
     {
       if (gameFileCache == null)
         return;
+      final GameFileCache cache = gameFileCache;
 
       // Rescan the file system and update the game list cache with the results
-      synchronized (gameFileCache)
+      synchronized (cache)
       {
-        boolean changed = gameFileCache.update(this);
-        if (changed)
+        try
         {
-          updateGameFileArray();
+          if (cache.scanLibrary(this))
+          {
+            updateGameFileArray();
+          }
         }
-
-        boolean additionalMetadataChanged = gameFileCache.updateAdditionalMetadata();
-        if (additionalMetadataChanged)
+        catch (Exception e)
         {
-          updateGameFileArray();
-        }
-        if (changed || additionalMetadataChanged)
-        {
-          gameFileCache.save();
+          org.dolphinemu.dolphinemu.utils.Log.error("[GameFileCacheService] Rescan failed: " + e);
         }
       }
     }
@@ -162,7 +163,7 @@ public final class GameFileCacheService extends IntentService
   {
     GameFile[] gameFilesTemp = gameFileCache.getAllGames();
     Arrays.sort(gameFilesTemp, (lhs, rhs) -> {
-        int ret = lhs.getTitle().compareToIgnoreCase(rhs.getTitle());
+        int ret = lhs.getGameId().compareToIgnoreCase(rhs.getGameId());
         return ret == 0 ? Integer.compare(lhs.getDiscNumber(), rhs.getDiscNumber()) : ret;
     });
     gameFiles.set(gameFilesTemp);
