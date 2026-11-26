@@ -27,6 +27,8 @@ V1_MARKERS = {
     "jni/GameList/GameFileCache.cpp": "big libraries overflow the JNI local reference table and the app aborts",
     "jni/MainAndroid.cpp": "Failed to boot the selected game.",
     "Core/Core/Core.cpp": "IsLittleCorePart",
+    "Core/Core/Config/GraphicsSettings.cpp":
+        '"ShaderCompilationMode"},\n    ShaderCompilationMode::AsynchronousSkipRendering}',
 }
 restored, restore_errors = [], []
 
@@ -75,6 +77,17 @@ def restore_v1_files():
 
 
 restore_v1_files()
+
+if "--restore-only" in sys.argv:
+    print("\n=== Restauracion de archivos del paquete anterior (solo restaurar) ===")
+    if not restored and not restore_errors:
+        print("  (nada que restaurar: el repo ya esta limpio)")
+    for r in restored:
+        print(f"  [RESTAURADO] {r}")
+    for e in restore_errors:
+        print(f"  [ERROR]      {e}")
+        print(f"::error::{e}")
+    sys.exit(1 if restore_errors else 0)
 
 
 
