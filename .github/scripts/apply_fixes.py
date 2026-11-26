@@ -61,7 +61,14 @@ def restore_v1_files():
             continue
         old = git("show", f"{sha}^:{rel}", cwd=top)
         if old.returncode != 0:
-            restore_errors.append(f"{rel}: no existe version anterior a {sha[:8]}")
+            has_parent = git("rev-parse", "--verify", "-q", f"{sha}^", cwd=top).returncode == 0
+            if has_parent:
+                # El paquete anterior CREO este archivo (antes no existia en esa ruta): puede estar
+                # tapando al original (p. ej. build.gradle junto a build.gradle.kts). Se elimina.
+                path.unlink()
+                restored.append(f"{rel} (archivo nuevo creado por el paquete anterior: eliminado)")
+            else:
+                restore_errors.append(f"{rel}: el commit {sha[:8]} no tiene version anterior")
             continue
         path.write_text(old.stdout, encoding="utf-8", newline="")
         restored.append(f"{rel} (version previa a {sha[:8]})")
@@ -82,24 +89,27 @@ def find_file(suffix):
     return hits[0] if hits else None
 
 
-def patch(suffix, label, old, new, marker, count=1, regex=False, requires=None, done=None, hint=None):
+def patch(suffix, label, old, new, marker, count=1, regex=False, requires=None, done=None, hint=None, quiet=False):
     path = find_file(suffix)
     if path is None:
-        missing.append(f"{label}: no existe {suffix}")
-        return
+        if not quiet:
+            missing.append(f"{label}: no existe {suffix}")
+        return False
     text = path.read_text(encoding="utf-8")
     if marker in text:
         skipped.append(f"{label}: ya aplicado")
-        return
+        return True
     if done and re.search(flex(done), text, re.S):
         skipped.append(f"{label}: ya estaba asi")
-        return
+        return True
     if requires and requires not in text:
         missing.append(f"{label}: omitido porque falta el parche previo ({requires})")
-        return
+        return False
     pattern = old if regex else flex(old)
     m = re.search(pattern, text, re.S)
     if not m:
+        if quiet:
+            return False
         missing.append(f"{label}: no se encontro el fragmento en {suffix} (tu rama es distinta)")
         if hint:
             lines = text.splitlines()
@@ -108,10 +118,22 @@ def patch(suffix, label, old, new, marker, count=1, regex=False, requires=None, 
                     lo, hi = max(0, i - 4), min(len(lines), i + 10)
                     diag.append(f"--- {suffix} (lineas {lo + 1}-{hi}) ---\n" + "\n".join(lines[lo:hi]))
                     break
-        return
+        return False
     text = re.sub(pattern, lambda _m: new, text, count=count, flags=re.S)
     path.write_text(text, encoding="utf-8")
     applied.append(label)
+    return True
+
+
+
+
+def patch_any(suffix, label, variants, marker, **kw):
+    """Prueba varias variantes (old, new) hasta que una encaje."""
+    for i, (old, new) in enumerate(variants):
+        last = i == len(variants) - 1
+        if patch(suffix, label, old, new, marker, quiet=not last, **kw):
+            return True
+    return False
 
 
 # --------------------------------------------------------------------------- MainActivity.kt
@@ -153,32 +175,31 @@ patch(
 )
 
 # --------------------------------------------------------------------------- GameFileCache.kt
-patch(
+patch_any(
     "model/GameFileCache.kt", "Cache: copia del set en scanLibrary",
-    old="""val folderPathsSet =
+    [
+        # tu rama
+        ("""val folderPathsSet = preferences.getStringSet(GAME_FOLDER_PATHS_PREFERENCE, HashSet())
+            ?: return false""",
+         """// [fix-copy] getStringSet() returns the live set owned by SharedPreferences; work on a copy.
+        val folderPathsSet: MutableSet<String> = HashSet(
+            preferences.getStringSet(GAME_FOLDER_PATHS_PREFERENCE, HashSet()) ?: return false
+        )"""),
+        # zip original
+        ("""val folderPathsSet =
             preferences.getStringSet(GAME_FOLDER_PATHS_PREFERENCE, HashSet())!!""",
-    new="""// [fix-copy] getStringSet() returns the live set; never mutate it, work on a copy.
+         """// [fix-copy] getStringSet() returns the live set owned by SharedPreferences; work on a copy.
         val folderPathsSet: MutableSet<String> = HashSet(
             preferences.getStringSet(GAME_FOLDER_PATHS_PREFERENCE, HashSet()) ?: HashSet()
-        )""",
+        )"""),
+    ],
     marker="[fix-copy]", hint=r"getStringSet",
 )
 patch(
     "model/GameFileCache.kt", "Cache: escanear solo carpetas existentes",
-    old="val folderPaths = folderPathsSet.toTypedArray<String>()",
-    new="val folderPaths = newFolderPaths.toTypedArray<String>() // [fix-existing]",
-    marker="[fix-existing]", hint=r"toTypedArray",
-)
-patch(
-    "model/GameFileCache.kt", "Cache: copia del set en addGameFolder",
-    old="""val folderPaths =
-                preferences.getStringSet(GAME_FOLDER_PATHS_PREFERENCE, HashSet())!!
-            if (!folderPaths.contains(path)) {""",
-    new="""val folderPaths: MutableSet<String> = HashSet( // [fix-copy2]
-                preferences.getStringSet(GAME_FOLDER_PATHS_PREFERENCE, HashSet()) ?: HashSet()
-            )
-            if (!folderPaths.contains(path)) {""",
-    marker="[fix-copy2]", hint=r"fun addGameFolder",
+    old="val folderPaths = folderPathsSet.toTypedArray",
+    new="val folderPaths = newFolderPaths.toTypedArray",
+    marker="newFolderPaths.toTypedArray", hint=r"toTypedArray",
 )
 
 # --------------------------------------------------------------------------- GameFileCacheService.java
@@ -456,14 +477,37 @@ patch(
     new='"-DCMAKE_BUILD_TYPE=Release", // [fix-flags]\n'
         '                    "-DCMAKE_C_FLAGS_RELEASE=-O3 -fno-math-errno -fno-trapping-math -DNDEBUG",\n'
         '                    "-DCMAKE_CXX_FLAGS_RELEASE=-O3 -fno-math-errno -fno-trapping-math -DNDEBUG"',
-    marker="[fix-flags]", hint=r"CMAKE_|arguments",
+    marker="[fix-flags]", quiet=True,
 )
 patch(
     "Android/app/build.gradle", "Gradle: firma con fallback a debug",
     old=r"signingConfig\s+signingConfigs\.release\b(?!\s*\{)",
     new="signingConfig (signingConfigs.release.storeFile?.exists() ? signingConfigs.release : signingConfigs.debug) // [fix-sign]",
-    marker="[fix-sign]", count=0, regex=True, hint=r"signingConfig",
+    marker="[fix-sign]", count=0, regex=True, quiet=True,
 )
+
+for _suffix in ("app/build.gradle", "app/build.gradle.kts"):
+    patch(
+        _suffix, f"Gradle simple ({_suffix.split('/')[-1]}): -Ofast -> -O3",
+        old="-DCMAKE_CXX_FLAGS_RELEASE=-Ofast",
+        new="-DCMAKE_CXX_FLAGS_RELEASE=-O3 -fno-math-errno -fno-trapping-math -DNDEBUG",
+        marker="-O3 -fno-math-errno -fno-trapping-math", quiet=True,
+    )
+
+# ---- listado de archivos de build (diagnostico)
+_build_dir = None
+for _p in ROOT.rglob("settings.gradle*"):
+    if "/Source/Android/" in _p.as_posix() + "/" and "/build/" not in _p.as_posix():
+        _build_dir = _p.parent
+        break
+if _build_dir:
+    names = sorted(x.relative_to(_build_dir).as_posix() for x in list(_build_dir.glob("*.gradle*"))
+                   + list(_build_dir.glob("app/*.gradle*")) + list(_build_dir.glob("gradle/*.toml")))
+    diag.append("--- archivos de build en " + _build_dir.relative_to(ROOT).as_posix() + " ---\n" + "\n".join(names))
+    for _f in _build_dir.glob("app/build.gradle*"):
+        lines = [l.strip() for l in _f.read_text(encoding="utf-8", errors="replace").splitlines()
+                 if re.search(r"coil|okhttp|picasso|CMAKE_(C|CXX)_FLAGS|signingConfig ", l)]
+        diag.append(f"--- lineas relevantes de {_f.name} ---\n" + "\n".join(lines[:25]))
 
 # --------------------------------------------------------------------------- resumen
 print("\n=== Restauracion de archivos del paquete anterior ===")
