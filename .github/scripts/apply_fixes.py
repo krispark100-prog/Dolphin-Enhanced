@@ -599,10 +599,10 @@ patch(
       if (appDir == null)
         appDir = context.getFilesDir();
       File fallback = new File(appDir, "dolphin-mmj");
-      CrashLogger.log("No se pudo usar " + userPath + "; probando " + fallback);
+      CrashLogger.log("ALERTA: no se pudo usar " + userPath + "; probando " + fallback);
       if (!isUsableDirectory(fallback))
       {
-        CrashLogger.log("Tampoco se pudo usar " + fallback);
+        CrashLogger.log("ALERTA: tampoco se pudo usar " + fallback);
         return false;
       }
       userPath = fallback;
@@ -621,13 +621,58 @@ patch(
     marker="[fix-ini]", hint=r"PrintWriter",
 )
 patch(
-    "settings/utils/SettingsFile.java", "Ajustes: registrar error de escritura",
-    old='Log.error("[SettingsFile] File not found: "',
-    new=("org.dolphinemu.dolphinemu.utils.CrashLogger.log(\"Ajustes: no se pudo escribir \" + ini + \": \" + e.getMessage());\n"
-         "      Log.error(\"[SettingsFile] File not found: \""),
-    marker="Ajustes: no se pudo escribir",
+    "settings/utils/SettingsFile.java", "Ajustes: registrar archivo no encontrado al LEER",
+    old='Log.error("[SettingsFile] File not found: " + ini.getAbsolutePath()',
+    new=('org.dolphinemu.dolphinemu.utils.CrashLogger.log("Ajustes (lectura): no existe " + ini.getAbsolutePath());\n'
+         '      Log.error("[SettingsFile] File not found: " + ini.getAbsolutePath()'),
+    marker="Ajustes (lectura): no existe", quiet=True,
+)
+patch(
+    "settings/utils/SettingsFile.java", "Ajustes: registrar error al ESCRIBIR",
+    old='Log.error("[SettingsFile] File not found: " + fileName',
+    new=('org.dolphinemu.dolphinemu.utils.CrashLogger.log("ALERTA: Ajustes: no se pudo escribir " + ini + ": " + e.getMessage());\n'
+         '      Log.error("[SettingsFile] File not found: " + fileName'),
+    marker="ALERTA: Ajustes: no se pudo escribir", quiet=True,
 )
 
+# --- CAUSA CONFIRMADA por el informe del dispositivo: getExternalCacheDir() == null en el Moto G20.
+#     1) GameFile.getCoverPath -> DirectoryInitialization.getCacheDirectory() hacia NPE (crash al listar juegos).
+#     2) setDolphinUserDirectory() hacia "return false" ANTES de extraer Sys, crear las carpetas de usuario
+#        (Config, etc.) y fijar Sys/Cache en el nativo => ajustes sin guardar, pantalla negra, crash.
+patch(
+    "utils/DirectoryInitialization.java", "Cache externa nula: getCacheDirectory sin NPE",
+    old=r"return\s+context\.getExternalCacheDir\(\)\.getPath\(\)\s*;",
+    new="""File extCache = context.getExternalCacheDir();  // [fix-cache-get]
+    if (extCache == null)
+      extCache = context.getCacheDir();
+    return extCache.getPath();""",
+    marker="[fix-cache-get]", regex=True, hint=r"getExternalCacheDir",
+)
+patch(
+    "utils/DirectoryInitialization.java", "Cache externa nula: no abortar la inicializacion",
+    old=r"File\s+cacheDir\s*=\s*context\.getExternalCacheDir\(\)\s*;\s*if\s*\(\s*cacheDir\s*==\s*null\s*\)\s*(?:\{\s*)?return\s+false\s*;(?:\s*\})?",
+    new="""File cacheDir = context.getExternalCacheDir();  // [fix-cache-init]
+    if (cacheDir == null)
+    {
+      // getExternalCacheDir() is null on some devices. Returning false here used to abort the
+      // whole initialization (Sys not extracted, Config folders not created, native paths unset).
+      CrashLogger.log("ALERTA: getExternalCacheDir() es null; usando la cache interna");
+      cacheDir = context.getCacheDir();
+    }""",
+    marker="[fix-cache-init]", regex=True, hint=r"getExternalCacheDir",
+)
+patch(
+    "utils/DirectoryInitialization.java", "Diagnostico: estado de inicializacion (OK)",
+    old="mDirectoryState = DirectoryInitializationState.DIRECTORIES_INITIALIZED;",
+    new='CrashLogger.log("DirectoryInitialization: INICIALIZADO user=" + mUserPath);  // [fix-di-ok]\n          mDirectoryState = DirectoryInitializationState.DIRECTORIES_INITIALIZED;',
+    marker="[fix-di-ok]", quiet=True,
+)
+patch(
+    "utils/DirectoryInitialization.java", "Diagnostico: estado de inicializacion (fallo)",
+    old="mDirectoryState = DirectoryInitializationState.CANT_FIND_EXTERNAL_STORAGE;",
+    new='CrashLogger.log("ALERTA: DirectoryInitialization fallo (CANT_FIND_EXTERNAL_STORAGE) user=" + mUserPath);  // [fix-di-fail]\n          mDirectoryState = DirectoryInitializationState.CANT_FIND_EXTERNAL_STORAGE;',
+    marker="[fix-di-fail]", quiet=True,
+)
 
 for _suffix in ("app/build.gradle", "app/build.gradle.kts"):
     patch(
