@@ -1,0 +1,52 @@
+name: Reparar fork (restaurar archivos y aplicar correcciones)
+
+# Ejecutar a mano desde Actions -> "Reparar fork..." -> Run workflow (eligiendo la rama opt2).
+#  - solo_restaurar:       deja el repo como estaba antes de subir los archivos del primer paquete.
+#  - restaurar_y_aplicar:  ademas aplica las correcciones (crash de carpeta, pantalla negra,
+#                          rendimiento) directamente en el codigo del repo y hace commit.
+# Despues de esto el CI normal del repo (android.yml) compila con los cambios ya incluidos.
+
+on:
+  workflow_dispatch:
+    inputs:
+      modo:
+        description: "Que hacer"
+        type: choice
+        default: restaurar_y_aplicar
+        options:
+          - restaurar_y_aplicar
+          - solo_restaurar
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (historial completo)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restaurar / aplicar
+        run: |
+          ROOT="$(git rev-parse --show-toplevel)"
+          if [ "${{ inputs.modo }}" = "solo_restaurar" ]; then
+            python3 .github/scripts/apply_fixes.py "$ROOT" --restore-only
+          else
+            python3 .github/scripts/apply_fixes.py "$ROOT"
+          fi
+
+      - name: Guardar cambios en la rama
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A -- Source
+          if git diff --cached --quiet; then
+            echo "No hay cambios que guardar."
+          else
+            git status --short
+            git commit -m "Reparar fork: ${{ inputs.modo }}"
+            git push origin "HEAD:${{ github.ref_name }}"
+          fi
