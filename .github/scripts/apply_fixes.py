@@ -5,6 +5,7 @@ Cada parche busca un fragmento (ignorando diferencias de espacios) y lo sustituy
 Si el fragmento no existe en tu rama, ese parche se omite con un aviso y el build sigue.
 Es idempotente: si ya se aplico, no hace nada.
 """
+import os
 import re
 import sys
 from pathlib import Path
@@ -97,6 +98,9 @@ def flex(snippet):
 
 
 def find_file(suffix):
+    if suffix.startswith("ROOT:"):
+        exact = ROOT / suffix[5:]
+        return exact if exact.is_file() else None
     hits = [p for p in ROOT.rglob("*") if p.is_file() and p.as_posix().endswith(suffix)
             and "/build/" not in p.as_posix() and "/.cxx/" not in p.as_posix()]
     return hits[0] if hits else None
@@ -379,102 +383,169 @@ JNIEXPORT void JNICALL Java_org_dolphinemu_dolphinemu_NativeLibrary_SurfaceDestr
     marker="[fix-surf2]", requires="[fix-surf]",
 )
 
-# --------------------------------------------------------------------------- Core.cpp (afinidad big cores)
-CORE_HELPER = r'''
-#ifdef __ANDROID__  // [fix-affinity]
-// Heterogeneous SoCs (e.g. Unisoc T700 in the Moto G20: 2x Cortex-A75 + 6x Cortex-A55) let the
-// scheduler park the CPU/GPU emulation threads on slow cores -> random FPS drops. Both clusters
-// report the same max frequency on that chip, so cores are classified by ARM "CPU part".
-static bool IsLittleCorePart(unsigned part)
-{
-  switch (part)
-  {
-  case 0xd03:  // A53
-  case 0xd04:  // A35
-  case 0xd05:  // A55
-  case 0xd46:  // A510
-  case 0xd80:  // A520
-    return true;
-  default:
-    return false;
-  }
-}
+# --------------------------------------------------------------------------- Rendimiento: hilos (big.LITTLE)
+SRC_TUNING = Path(__file__).parent / "native_src" / "AndroidThreadTuning.h"
+if SRC_TUNING.exists():
+    _tuning_text = SRC_TUNING.read_text(encoding="utf-8")
+else:
+    _tuning_text = None
+    missing.append("Rendimiento: falta .github/scripts/native_src/AndroidThreadTuning.h")
 
-static const std::vector<int>& GetBigCores()
-{
-  static const std::vector<int> big_cores = [] {
-    std::vector<unsigned> parts;
-    if (FILE* f = fopen("/proc/cpuinfo", "r"))
-    {
-      char line[256];
-      while (fgets(line, sizeof(line), f))
-      {
-        unsigned part = 0;
-        if (sscanf(line, "CPU part : %x", &part) == 1)
-          parts.push_back(part);
-      }
-      fclose(f);
-    }
+_tuning_dir = find_file("Core/Common/Thread.h")
+if _tuning_text and _tuning_dir is not None:
+    _dest = _tuning_dir.parent / "AndroidThreadTuning.h"
+    if _dest.exists() and _dest.read_text(encoding="utf-8") == _tuning_text:
+        skipped.append("Rendimiento: AndroidThreadTuning.h ya existe")
+    else:
+        _dest.write_text(_tuning_text, encoding="utf-8")
+        applied.append("Rendimiento: AndroidThreadTuning.h (archivo nuevo)")
+elif _tuning_text:
+    missing.append("Rendimiento: no se encontro Core/Common/Thread.h para ubicar el header")
 
-    std::vector<int> big;
-    const int n = static_cast<int>(parts.size());
-    for (int i = 0; i < n; ++i)
-    {
-      if (!IsLittleCorePart(parts[i]))
-        big.push_back(i);
-    }
-
-    // Homogeneous CPU, or a single big core: pinning would not help (or would hurt).
-    if (big.size() < 2 || static_cast<int>(big.size()) == n)
-      big.clear();
-    return big;
-  }();
-  return big_cores;
-}
-
-static void PinCurrentThreadToBigCores()
-{
-  const std::vector<int>& big = GetBigCores();
-  if (big.empty())
-    return;
-
-  cpu_set_t set;
-  CPU_ZERO(&set);
-  for (const int core : big)
-    CPU_SET(core, &set);
-  sched_setaffinity(0, sizeof(set), &set);  // pid 0 == calling thread; failure is harmless
-}
-#else
-static void PinCurrentThreadToBigCores()
-{
-}
-#endif
-
-'''
-patch(
-    "Core/Core/Core.cpp", "Core: includes de afinidad",
-    old="#include <variant>\n",
-    new="#include <variant>\n#ifdef __ANDROID__\n#include <sched.h>\n#include <cstdio>\n#include <vector>\n#endif  // [fix-affinity-inc]\n",
-    marker="[fix-affinity-inc]",
+# Opcion de configuracion nativa (Dolphin.ini -> [Core] AndroidThreadTuning, por defecto activada)
+_h_ok = patch(
+    "Core/Config/MainSettings.h", "Rendimiento: opcion AndroidThreadTuning (.h)",
+    old="extern const ConfigInfo<bool> MAIN_SYNC_ON_SKIP_IDLE;",
+    new="extern const ConfigInfo<bool> MAIN_SYNC_ON_SKIP_IDLE;\nextern const ConfigInfo<bool> MAIN_ANDROID_THREAD_TUNING;  // [fix-cfg]",
+    marker="[fix-cfg]", quiet=True,
 )
-patch(
-    "Core/Core/Core.cpp", "Core: helper de afinidad",
-    old=r"// Create the CPU thread, which is a CPU + Video thread in Single Core mode.",
-    new=CORE_HELPER + "// Create the CPU thread, which is a CPU + Video thread in Single Core mode.",
-    marker="[fix-affinity]",
+_c_ok = patch(
+    "Core/Config/MainSettings.cpp", "Rendimiento: opcion AndroidThreadTuning (.cpp)",
+    old='const ConfigInfo<bool> MAIN_SYNC_ON_SKIP_IDLE{{System::Main, "Core", "SyncOnSkipIdle"}, true};',
+    new='const ConfigInfo<bool> MAIN_SYNC_ON_SKIP_IDLE{{System::Main, "Core", "SyncOnSkipIdle"}, true};\n'
+        'const ConfigInfo<bool> MAIN_ANDROID_THREAD_TUNING{{System::Main, "Core", "AndroidThreadTuning"}, true};  // [fix-cfg]',
+    marker="[fix-cfg]", quiet=True,
 )
+CFG_OK = bool(_h_ok and _c_ok)
+if not CFG_OK:
+    missing.append("Rendimiento: no se pudo crear la opcion AndroidThreadTuning; los hilos se ajustaran siempre")
+
+_inc = '#include "Core/Core.h"\n#include "Common/AndroidThreadTuning.h"  // [fix-tune-inc]'
+if CFG_OK:
+    _inc += '\n#include "Core/Config/MainSettings.h"'
 patch(
-    "Core/Core/Core.cpp", "Core: fijar hilo de CPU",
+    "Core/Core/Core.cpp", "Rendimiento: include del header de hilos",
+    old='#include "Core/Core.h"', new=_inc, marker="[fix-tune-inc]",
+)
+_call = "Common::AndroidTuning::BoostEmuThread();"
+_cond = ("if (Config::Get(Config::MAIN_ANDROID_THREAD_TUNING))\n    " + _call) if CFG_OK else _call
+patch(
+    "Core/Core/Core.cpp", "Rendimiento: CPU thread en nucleos rapidos",
     old='Common::SetCurrentThreadName("CPU-GPU thread");',
-    new='Common::SetCurrentThreadName("CPU-GPU thread");\n  PinCurrentThreadToBigCores();  // [fix-pin1]',
-    marker="[fix-pin1]", requires="[fix-affinity]",
+    new='Common::SetCurrentThreadName("CPU-GPU thread");\n  ' + _cond + '  // [fix-tune1]',
+    marker="[fix-tune1]", requires="[fix-tune-inc]",
 )
 patch(
-    "Core/Core/Core.cpp", "Core: fijar hilo de video",
+    "Core/Core/Core.cpp", "Rendimiento: Video thread en nucleos rapidos",
     old='Common::SetCurrentThreadName("Video thread");',
-    new='Common::SetCurrentThreadName("Video thread");\n    PinCurrentThreadToBigCores();  // [fix-pin2]',
-    marker="[fix-pin2]", requires="[fix-affinity]",
+    new='Common::SetCurrentThreadName("Video thread");\n    ' + _cond.replace("\n    ", "\n      ") + '  // [fix-tune2]',
+    marker="[fix-tune2]", requires="[fix-tune-inc]",
 )
+# Los hilos de compilacion de shaders se crean desde el hilo de video (ya fijado) y heredarian su
+# mascara de CPU: se liberan para que no compitan con los hilos principales.
+patch(
+    "VideoCommon/AsyncShaderCompiler.cpp", "Rendimiento: include en AsyncShaderCompiler",
+    old='#include "VideoCommon/AsyncShaderCompiler.h"',
+    new='#include "VideoCommon/AsyncShaderCompiler.h"\n#include "Common/AndroidThreadTuning.h"  // [fix-tune-inc2]',
+    marker="[fix-tune-inc2]",
+)
+patch(
+    "VideoCommon/AsyncShaderCompiler.cpp", "Rendimiento: workers de shaders sin mascara heredada",
+    old=r"void\s+AsyncShaderCompiler::WorkerThreadEntryPoint\(void\*\s*param\)\s*\{",
+    new="\n  Common::AndroidTuning::BackgroundWorker();  // [fix-tune3]",
+    marker="[fix-tune3]", regex=True, keep=True, requires="[fix-tune-inc2]",
+)
+
+# Hilo de envio de comandos de Vulkan ("Backend Multithreading"): tambien se crea desde el hilo de
+# video, asi que heredaria los 2 nucleos rapidos y competiria con la CPU/GPU emuladas.
+patch(
+    "VideoBackends/Vulkan/CommandBufferManager.cpp", "Vulkan: include del header de hilos",
+    old='#include "Common/Assert.h"',
+    new='#include "Common/Assert.h"\n#include "Common/AndroidThreadTuning.h"  // [fix-tune-inc3]',
+    marker="[fix-tune-inc3]",
+)
+patch(
+    "VideoBackends/Vulkan/CommandBufferManager.cpp", "Vulkan: hilo de envio sin mascara heredada",
+    old=r"m_submit_thread\s*=\s*std::thread\(\[this\]\(\)\s*\{",
+    new="\n    Common::AndroidTuning::BackgroundWorker();  // [fix-tune4]",
+    marker="[fix-tune4]", regex=True, keep=True, requires="[fix-tune-inc3]",
+)
+
+# Hilos de compilacion de shaders: 1 era demasiado lento con shaders asincronos (por defecto 3;
+# en el menu, 0 = automatico).
+patch(
+    "Core/Config/GraphicsSettings.cpp", "Shaders: 3 hilos de compilacion por defecto",
+    old='{System::GFX, "Settings", "ShaderCompilerThreads"}, 1};',
+    new='{System::GFX, "Settings", "ShaderCompilerThreads"}, 3 /* [fix-threads] */};',
+    marker="[fix-threads]", quiet=True,
+)
+patch(
+    "VideoCommon/VideoConfig.cpp", "Shaders: 0 = automatico",
+    old="iShaderCompilerThreads = Config::Get(Config::GFX_SHADER_COMPILER_THREADS);",
+    new="iShaderCompilerThreads = Config::Get(Config::GFX_SHADER_COMPILER_THREADS);\n"
+        "  if (iShaderCompilerThreads == 0)  // [fix-threads2] menu: 0 = automatic\n"
+        "    iShaderCompilerThreads = -1;",
+    marker="[fix-threads2]", quiet=True,
+)
+
+# ---- Opciones nuevas en el menu de Graficos
+_STR_EN = """
+    <string name="g20_thread_tuning">Prioritize emulation threads (fast cores)</string>
+    <string name="g20_thread_tuning_description">Pins the emulated CPU and GPU threads to the fast CPU cores and raises their priority. Helps on phones with big.LITTLE processors (for example Moto G20). Applies the next time a game starts.</string>
+    <string name="g20_shader_threads">Shader compiler threads</string>
+    <string name="g20_shader_threads_description">0 = automatic. More threads make shaders ready sooner (fewer missing graphics and stutters) but use more CPU. Applies the next time a game starts.</string>
+"""
+_STR_ES = """
+    <string name="g20_thread_tuning">Priorizar hilos de emulación (núcleos rápidos)</string>
+    <string name="g20_thread_tuning_description">Fija los hilos de CPU y GPU emuladas a los núcleos rápidos del procesador y les sube la prioridad. Ayuda en teléfonos con procesadores big.LITTLE (por ejemplo Moto G20). Se aplica al iniciar el próximo juego.</string>
+    <string name="g20_shader_threads">Hilos de compilación de shaders</string>
+    <string name="g20_shader_threads_description">0 = automático. Más hilos hacen que los shaders estén listos antes (menos gráficos faltantes y tirones) pero usan más CPU. Se aplica al iniciar el próximo juego.</string>
+"""
+_en_ok = patch(
+    "res/values/strings.xml", "Menu: textos nuevos (EN)",
+    old="</resources>", new=_STR_EN + "\n</resources>", marker="g20_thread_tuning", quiet=True,
+)
+_es_ok = patch(
+    "res/values-es/strings.xml", "Menu: textos nuevos (ES)",
+    old="</resources>", new=_STR_ES + "\n</resources>", marker="g20_thread_tuning", quiet=True,
+)
+
+
+def _file_matches(suffix, regex):
+    f = find_file(suffix)
+    return bool(f and re.search(regex, f.read_text(encoding="utf-8", errors="replace"), re.S))
+
+
+_menu_ok = _en_ok and _file_matches(
+    "settings/model/view/SliderSetting.kt",
+    r"val\s+max:\s*Int,\s*val\s+units:\s*String,\s*private\s+val\s+defaultValue:\s*Int,\s*setting:\s*Setting\?",
+)
+if _menu_ok:
+    patch(
+        "settings/ui/SettingsFragmentPresenter.kt", "Menu: opciones de rendimiento (hilos y shaders)",
+        old=r"R\.string\.backend_multithreading_description,\s*true,\s*backendMultithreading\s*\)\s*\)",
+        new="""
+
+        // [fix-menu] Rendimiento (procesadores big.LITTLE / compilacion de shaders)
+        val perfCoreSection = settings!!.getSection(Settings.SECTION_INI_CORE)
+        sl.add(
+            CheckBoxSetting(
+                "AndroidThreadTuning", Settings.SECTION_INI_CORE,
+                R.string.g20_thread_tuning, R.string.g20_thread_tuning_description, true,
+                perfCoreSection.getSetting("AndroidThreadTuning")
+            )
+        )
+        sl.add(
+            SliderSetting(
+                "ShaderCompilerThreads", Settings.SECTION_GFX_SETTINGS,
+                R.string.g20_shader_threads, R.string.g20_shader_threads_description, 6, "", 3,
+                gfxSection.getSetting("ShaderCompilerThreads")
+            )
+        )""",
+        marker="[fix-menu]", regex=True, keep=True, hint=r"backend_multithreading",
+    )
+else:
+    missing.append("Menu: no se agregaron las opciones nuevas (strings o SliderSetting distintos en tu rama)")
 
 # --------------------------------------------------------------------------- GraphicsSettings.cpp
 patch(
@@ -656,7 +727,7 @@ patch(
     {
       // getExternalCacheDir() is null on some devices. Returning false here used to abort the
       // whole initialization (Sys not extracted, Config folders not created, native paths unset).
-      CrashLogger.log("ALERTA: getExternalCacheDir() es null; usando la cache interna");
+      CrashLogger.log("Aviso: getExternalCacheDir() es null; usando la cache interna");
       cacheDir = context.getCacheDir();
     }""",
     marker="[fix-cache-init]", regex=True, hint=r"getExternalCacheDir",
@@ -673,6 +744,22 @@ patch(
     new='CrashLogger.log("ALERTA: DirectoryInitialization fallo (CANT_FIND_EXTERNAL_STORAGE) user=" + mUserPath);  // [fix-di-fail]\n          mDirectoryState = DirectoryInitializationState.CANT_FIND_EXTERNAL_STORAGE;',
     marker="[fix-di-fail]", quiet=True,
 )
+
+if os.environ.get("DOLPHIN_LTO") == "1":
+    patch(
+        "ROOT:CMakeLists.txt", "Rendimiento: LTO thin (opcional)",
+        old=r"project\(\s*dolphin-emu[^)]*\)",
+        new="""
+
+# [fix-lto] Link-time optimization for Android release builds (enabled by the workflow input).
+if(ANDROID)
+  set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -flto=thin")
+  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -flto=thin")
+  set(CMAKE_SHARED_LINKER_FLAGS_RELEASE "${CMAKE_SHARED_LINKER_FLAGS_RELEASE} -flto=thin")
+endif()
+""",
+        marker="[fix-lto]", regex=True, keep=True,
+    )
 
 for _suffix in ("app/build.gradle", "app/build.gradle.kts"):
     patch(
