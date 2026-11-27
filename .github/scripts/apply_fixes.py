@@ -488,18 +488,125 @@ patch(
     marker="[fix-threads2]", quiet=True,
 )
 
+# ---- Vulkan: guardar la cache de pipelines compilados periodicamente (no solo al cerrar bien).
+# El driver Mali tarda mucho en compilar cada pipeline; si la app se cierra de golpe (la mata Android,
+# se desliza fuera de recientes, crash) se perdia todo lo compilado en la sesion.
+_pc1 = patch(
+    "VideoBackends/Vulkan/ObjectCache.h", "Vulkan cache: include chrono",
+    old="#pragma once", new="#pragma once\n\n#include <chrono>  // [fix-pcache-inc]",
+    marker="[fix-pcache-inc]", quiet=True,
+)
+_pc2 = patch(
+    "VideoBackends/Vulkan/ObjectCache.h", "Vulkan cache: declaracion",
+    old="void SavePipelineCache();",
+    new="void SavePipelineCache();\n\n  // Saves the pipeline cache again when it grew. Cheap to call every frame.\n"
+        "  void SavePipelineCacheIfNeeded();  // [fix-pcache]",
+    marker="[fix-pcache]", quiet=True,
+)
+_pc3 = patch(
+    "VideoBackends/Vulkan/ObjectCache.h", "Vulkan cache: estado",
+    old="std::string m_pipeline_cache_filename;",
+    new="std::string m_pipeline_cache_filename;\n"
+        "  std::chrono::steady_clock::time_point m_pipeline_cache_last_check = std::chrono::steady_clock::now();\n"
+        "  std::chrono::steady_clock::time_point m_pipeline_cache_last_save = std::chrono::steady_clock::now();\n"
+        "  size_t m_pipeline_cache_saved_size = 0;  // [fix-pcache-mem]",
+    marker="[fix-pcache-mem]", quiet=True,
+)
+_PC_FUNC = """// [fix-pcache-fn]
+void ObjectCache::SavePipelineCacheIfNeeded()
+{
+  using Clock = std::chrono::steady_clock;
+  if (m_pipeline_cache == VK_NULL_HANDLE || !g_ActiveConfig.bShaderCache)
+    return;
+
+  const Clock::time_point now = Clock::now();
+  if (now - m_pipeline_cache_last_check < std::chrono::seconds(60))
+    return;
+  m_pipeline_cache_last_check = now;
+
+  size_t size = 0;
+  if (vkGetPipelineCacheData(g_vulkan_context->GetDevice(), m_pipeline_cache, &size, nullptr) !=
+      VK_SUCCESS)
+  {
+    return;
+  }
+
+  // First check of the session: remember how big the cache loaded from disk was.
+  if (m_pipeline_cache_saved_size == 0)
+  {
+    m_pipeline_cache_saved_size = size;
+    return;
+  }
+
+  const bool grew_a_lot = size > m_pipeline_cache_saved_size + 256 * 1024;
+  const bool grew_a_bit =
+      size > m_pipeline_cache_saved_size && now - m_pipeline_cache_last_save > std::chrono::minutes(10);
+  if (!grew_a_lot && !grew_a_bit)
+    return;
+
+  SavePipelineCache();
+  m_pipeline_cache_saved_size = size;
+  m_pipeline_cache_last_save = now;
+}
+
+void ObjectCache::ReloadPipelineCache()"""
+_pc_ok = bool(_pc1 and _pc2 and _pc3)
+if _pc_ok:
+    _pc4 = patch(
+        "VideoBackends/Vulkan/ObjectCache.cpp", "Vulkan cache: guardado periodico",
+        old="void ObjectCache::ReloadPipelineCache()", new=_PC_FUNC, marker="[fix-pcache-fn]", quiet=True,
+    )
+    if _pc4:
+        patch(
+            "VideoBackends/Vulkan/Renderer.cpp", "Vulkan cache: llamar cada frame",
+            old=r"void\s+Renderer::PresentBackbuffer\(\)\s*\{",
+            new="\n  if (g_object_cache)  // [fix-pcache-call]\n    g_object_cache->SavePipelineCacheIfNeeded();\n",
+            marker="[fix-pcache-call]", regex=True, keep=True, quiet=True,
+        )
+else:
+    missing.append("Vulkan cache: no se pudo preparar el guardado periodico (ObjectCache distinto en tu rama)")
+
+# ---- Superficie de salida reducida (ahorra GPU con resolucion interna 1x)
+SRC_PERF = Path(__file__).parent / "perf_src" / "PerfSurface.java"
+_surface_ok = False
+_di = find_file("utils/DirectoryInitialization.java") or find_file("utils/DirectoryInitialization.kt")
+if SRC_PERF.exists() and _di is not None:
+    _di_text = _di.read_text(encoding="utf-8", errors="replace")
+    if re.search(r"getUserDirectory\s*\(", _di_text):
+        _dest = _di.parent / "PerfSurface.java"
+        _src = SRC_PERF.read_text(encoding="utf-8")
+        if not (_dest.exists() and _dest.read_text(encoding="utf-8") == _src):
+            _dest.write_text(_src, encoding="utf-8")
+            applied.append("Superficie reducida: PerfSurface.java (archivo nuevo)")
+        else:
+            skipped.append("Superficie reducida: PerfSurface.java ya existe")
+        _surface_ok = patch(
+            "fragments/EmulationFragment.kt", "Superficie reducida: aplicar al crear la vista",
+            old=r"surfaceView\.holder\.addCallback\(this\)",
+            new="\n        activity?.let { org.dolphinemu.dolphinemu.utils.PerfSurface.apply(it, surfaceView.holder) }  // [fix-surface-size]",
+            marker="[fix-surface-size]", regex=True, keep=True, quiet=True,
+        )
+    else:
+        missing.append("Superficie reducida: DirectoryInitialization no tiene getUserDirectory() en tu rama")
+else:
+    missing.append("Superficie reducida: faltan perf_src/PerfSurface.java o DirectoryInitialization")
+
 # ---- Opciones nuevas en el menu de Graficos
 _STR_EN = """
     <string name="g20_thread_tuning">Prioritize emulation threads (fast cores)</string>
     <string name="g20_thread_tuning_description">Pins the emulated CPU and GPU threads to the fast CPU cores and raises their priority. Helps on phones with big.LITTLE processors (for example Moto G20). Applies the next time a game starts.</string>
     <string name="g20_shader_threads">Shader compiler threads</string>
     <string name="g20_shader_threads_description">0 = automatic. More threads make shaders ready sooner (fewer missing graphics and stutters) but use more CPU. Applies the next time a game starts.</string>
+    <string name="g20_fixed_res">Reduce output resolution (saves GPU)</string>
+    <string name="g20_fixed_res_description">Renders the final image at about 480p per internal-resolution step and lets Android scale it to your screen. Saves GPU work on weak phones with no visible loss at 1x. Turn it off if the image looks blurry. Applies the next time a game starts.</string>
 """
 _STR_ES = """
     <string name="g20_thread_tuning">Priorizar hilos de emulación (núcleos rápidos)</string>
     <string name="g20_thread_tuning_description">Fija los hilos de CPU y GPU emuladas a los núcleos rápidos del procesador y les sube la prioridad. Ayuda en teléfonos con procesadores big.LITTLE (por ejemplo Moto G20). Se aplica al iniciar el próximo juego.</string>
     <string name="g20_shader_threads">Hilos de compilación de shaders</string>
     <string name="g20_shader_threads_description">0 = automático. Más hilos hacen que los shaders estén listos antes (menos gráficos faltantes y tirones) pero usan más CPU. Se aplica al iniciar el próximo juego.</string>
+    <string name="g20_fixed_res">Reducir resolución de salida (ahorra GPU)</string>
+    <string name="g20_fixed_res_description">Dibuja la imagen final a unos 480p por cada paso de resolución interna y deja que Android la escale a tu pantalla. Ahorra trabajo de GPU en teléfonos débiles sin pérdida visible en 1x. Desactivala si la imagen se ve borrosa. Se aplica al iniciar el próximo juego.</string>
 """
 _en_ok = patch(
     "res/values/strings.xml", "Menu: textos nuevos (EN)",
@@ -546,6 +653,22 @@ if _menu_ok:
     )
 else:
     missing.append("Menu: no se agregaron las opciones nuevas (strings o SliderSetting distintos en tu rama)")
+
+if _menu_ok and _surface_ok:
+    patch(
+        "settings/ui/SettingsFragmentPresenter.kt", "Menu: reducir resolucion de salida",
+        old=r'gfxSection\.getSetting\("ShaderCompilerThreads"\)\s*\)\s*\)',
+        new="""
+
+        sl.add(  // [fix-menu2]
+            CheckBoxSetting(
+                "FixedOutputResolution", Settings.SECTION_GFX_SETTINGS,
+                R.string.g20_fixed_res, R.string.g20_fixed_res_description, true,
+                gfxSection.getSetting("FixedOutputResolution")
+            )
+        )""",
+        marker="[fix-menu2]", regex=True, keep=True, requires="[fix-menu]", quiet=True,
+    )
 
 # --------------------------------------------------------------------------- GraphicsSettings.cpp
 patch(
