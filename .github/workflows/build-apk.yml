@@ -10,6 +10,10 @@ on:
         options:
           - release
           - debug
+      lto:
+        description: "LTO thin: binario mas rapido (+5-10 %), pero compila mas lento y puede fallar"
+        type: boolean
+        default: false
   push:
     branches: [ master, main ]
     paths:
@@ -64,6 +68,8 @@ jobs:
           fetch Externals/Vulkan-Headers https://github.com/KhronosGroup/Vulkan-Headers.git
 
       - name: Aplicar correcciones sobre los archivos del fork
+        env:
+          DOLPHIN_LTO: ${{ inputs.lto && '1' || '0' }}
         run: python3 .github/scripts/apply_fixes.py "${{ steps.find.outputs.root_dir }}"
 
       - name: Java 17
