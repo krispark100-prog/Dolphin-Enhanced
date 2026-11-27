@@ -177,8 +177,15 @@ void VideoConfig::VerifyValidity()
 
 static u32 GetNumAutoShaderCompilerThreads()
 {
+#if defined(__ANDROID__)
+  // Experimental low-contention setting for Android Vulkan devices. A single
+  // background compiler worker reduces CPU contention during gameplay; this
+  // trades shader-cache warm-up speed for smoother frame pacing.
+  return 1;
+#else
   // Automatic number. We use clamp(cpus - 3, 1, 4).
   return static_cast<u32>(std::min(std::max(cpu_info.num_cores - 3, 1), 4));
+#endif
 }
 
 u32 VideoConfig::GetShaderCompilerThreads() const
