@@ -3,6 +3,7 @@ package org.dolphinemu.dolphinemu.utils;
 import android.app.Activity;
 import android.app.ActivityManager;
 import android.app.AlertDialog;
+import android.app.Application;
 import android.app.ApplicationExitInfo;
 import android.content.ClipData;
 import android.content.ClipboardManager;
@@ -11,6 +12,9 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Typeface;
 import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.Environment;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -40,6 +44,7 @@ public final class CrashLogger
   private static final String CRASH_FILE = "crash_log.txt";
   private static final String CRUMB_FILE = "breadcrumbs.txt";
   private static final String ALERT_FLAG = "alert.flag";
+  private static final String PREF_THREADS_REPORTED = "threads_reported";
   private static final String PREFS = "crash_logger";
   private static final String PREF_LAST_EXIT = "last_exit_ts";
   private static final int MAX_CRUMB_BYTES = 48 * 1024;
@@ -71,6 +76,104 @@ public final class CrashLogger
           previous.uncaughtException(thread, throwable);
       });
       log("--- app iniciada ---");
+      registerEmulationWatcher();
+    }
+    catch (Throwable ignored)
+    {
+    }
+  }
+
+  /** Cuando se abre la pantalla de emulacion, registra (una vez) como quedaron repartidos los hilos. */
+  private static void registerEmulationWatcher()
+  {
+    if (!(appContext instanceof Application))
+      return;
+    ((Application) appContext).registerActivityLifecycleCallbacks(
+            new Application.ActivityLifecycleCallbacks()
+            {
+              @Override
+              public void onActivityResumed(Activity activity)
+              {
+                if (!"EmulationActivity".equals(activity.getClass().getSimpleName()))
+                  return;
+                new Handler(Looper.getMainLooper()).postDelayed(() -> logEmuThreads(), 25000);
+              }
+
+              @Override public void onActivityCreated(Activity a, Bundle b) { }
+              @Override public void onActivityStarted(Activity a) { }
+              @Override public void onActivityPaused(Activity a) { }
+              @Override public void onActivityStopped(Activity a) { }
+              @Override public void onActivitySaveInstanceState(Activity a, Bundle b) { }
+              @Override public void onActivityDestroyed(Activity a) { }
+            });
+  }
+
+  private static String readSmall(File f)
+  {
+    try (FileInputStream in = new FileInputStream(f))
+    {
+      byte[] buf = new byte[2048];
+      int n = in.read(buf);
+      return n > 0 ? new String(buf, 0, n, "UTF-8") : "";
+    }
+    catch (Throwable t)
+    {
+      return "";
+    }
+  }
+
+  /** Registra nucleos disponibles y en que nucleos/prioridad corre cada hilo importante. */
+  public static void logEmuThreads()
+  {
+    try
+    {
+      StringBuilder caps = new StringBuilder();
+      for (int i = 0; i < Runtime.getRuntime().availableProcessors(); i++)
+      {
+        String c = readSmall(new File("/sys/devices/system/cpu/cpu" + i + "/cpu_capacity")).trim();
+        String fr = readSmall(new File("/sys/devices/system/cpu/cpu" + i +
+                "/cpufreq/cpuinfo_max_freq")).trim();
+        caps.append(" cpu").append(i).append("=").append(c.isEmpty() ? "?" : c)
+                .append("/").append(fr.isEmpty() ? "?" : fr);
+      }
+      log("HILOS: nucleos (capacidad/freq max kHz):" + caps);
+
+      File[] tasks = new File("/proc/self/task").listFiles();
+      if (tasks == null)
+        return;
+      for (File t : tasks)
+      {
+        String comm = readSmall(new File(t, "comm")).trim();
+        String lower = comm.toLowerCase(Locale.US);
+        if (!(lower.contains("cpu") || lower.contains("video") || lower.contains("gpu") ||
+                lower.contains("shader") || lower.contains("emu") || lower.contains("dsp") ||
+                lower.contains("audio") || lower.contains("dvd")))
+          continue;
+        String allowed = "?";
+        for (String line : readSmall(new File(t, "status")).split("\n"))
+        {
+          if (line.startsWith("Cpus_allowed_list"))
+            allowed = line.substring(line.indexOf(':') + 1).trim();
+        }
+        String nice = "?";
+        String stat = readSmall(new File(t, "stat"));
+        int close = stat.lastIndexOf(')');
+        if (close > 0)
+        {
+          String[] f = stat.substring(close + 2).split(" ");
+          if (f.length > 16)
+            nice = f[16];
+        }
+        log("HILO " + comm + " (tid " + t.getName() + ") cpus=" + allowed + " nice=" + nice);
+      }
+
+      // Una sola vez por instalacion: mostrar este detalle en el proximo inicio.
+      SharedPreferences prefs = appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+      if (!prefs.getBoolean(PREF_THREADS_REPORTED, false))
+      {
+        prefs.edit().putBoolean(PREF_THREADS_REPORTED, true).apply();
+        log("ALERTA: informe unico de hilos (se muestra una sola vez)");
+      }
     }
     catch (Throwable ignored)
     {
