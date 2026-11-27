@@ -91,5 +91,12 @@ constexpr u32 TEXTURE_UPLOAD_BUFFER_SIZE = 32 * 1024 * 1024;
 // streaming buffer and be blocking frequently. Games are unlikely to have textures this
 // large anyway, so it's only really an issue for HD texture packs, and memory is not
 // a limiting factor in these scenarios anyway.
+#if defined(__ANDROID__)
+// Android low-memory/CPU devices: use temporary staging buffers for uploads above
+// 2 MiB to reduce pressure on the shared texture upload ring buffer. This is
+// experimental and may increase allocation overhead on some drivers.
+constexpr u32 STAGING_TEXTURE_UPLOAD_THRESHOLD = 1024 * 1024 * 2;
+#else
 constexpr u32 STAGING_TEXTURE_UPLOAD_THRESHOLD = 1024 * 1024 * 4;
+#endif
 }  // namespace Vulkan
